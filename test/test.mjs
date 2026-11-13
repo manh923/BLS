@@ -30,9 +30,28 @@ const rnd = () => { const b = new Uint8Array(48); crypto.getRandomValues(b); let
   let t = I.f12mul(I.f12conj(f0), I.f12inv(f0));
   t = I.f12mul(I.f12frob(t, 2), t);
   ok("cycSqr = f12sqr (円分部分群)", I.f12eq(I.cycSqr(t), I.f12sqr(t)));
+  ok("cycExp (Karabina 圧縮) = cycExp (Granger–Scott)", I.f12eq(I.cycExp(t), I.cycExpGS(t)));
+  ok("cycExp(1) = 1", I.f12eq(I.cycExp(I.F12_1), I.F12_1));
   // 最終冪 = 素朴版の 3 乗
   const slow = I.f12pow(t, I.HARD_EXP);
   ok("finalExp = (素朴な最終冪)^3", I.f12eq(I.finalExp(f0), I.f12mul(I.f12mul(slow, slow), slow)));
+}
+{
+  // Fp2 の平方根: 平方剰余なら √ が合う、非剰余なら null
+  let good = true, nonres = 0;
+  for (let i = 0; i < 40; i++) {
+    const a = [rnd() % P, rnd() % P];
+    const sq = I.f2sqr(a);
+    const r = I.f2sqrt(sq);
+    if (!r || I.f2sqr(r).join() !== sq.join()) good = false;
+    const b = [rnd() % P, rnd() % P];
+    const rb = I.f2sqrt(b);
+    if (rb === null) nonres++; else if (I.f2sqr(rb).join() !== b.join()) good = false;
+  }
+  ok(`f2sqrt (平方剰余40個 OK, ランダム40個中 非剰余 ${nonres} 個)`, good && nonres > 5 && nonres < 35);
+  let lg = true;
+  for (let i = 0; i < 40; i++) { const a = rnd() % P; const s = (a * a) % P; if (I.fpLegendre(s) !== 1) lg = false; }
+  ok("fpLegendre(平方) = 1", lg && I.fpLegendre(0n) === 0 && I.fpLegendre(P - 1n) === -1);
 }
 for (let i = 0; i < 3; i++) {
   const k = rnd() % R;
@@ -116,6 +135,28 @@ ok("fastAggregateVerify ok", bls.fastAggregateVerify(msg, keys.map((k) => k.publ
 ok("fastAggregateVerify 1人抜け NG", !bls.fastAggregateVerify(msg, keys.slice(0, 2).map((k) => k.publicKey), aggSame));
 ok("aggPk = noble", toHex(bls.aggregatePublicKeys(keys.map((k) => k.publicKey))) ===
   toHex(nb.aggregatePublicKeys(keys.map((k) => fromHex(k.publicKey)))));
+
+// バッチ検証
+{
+  const ks = Array.from({ length: 5 }, () => bls.generateKeyPair());
+  const ms = ks.map((_, i) => enc.encode("batch-" + i));
+  const items = ks.map((k, i) => ({ msg: ms[i], pk: k.publicKey, sig: bls.sign(ms[i], k.privateKey) }));
+  ok("verifyBatch 5件 ok", t("verifyBatch(5)", () => bls.verifyBatch(items)));
+  const bad = items.map((x) => ({ ...x }));
+  bad[2] = { ...bad[2], sig: items[3].sig };
+  ok("verifyBatch 1件だけ不正なら NG", !bls.verifyBatch(bad));
+  // σ1 + Δ, σ2 - Δ: 素朴に足すだけだと打ち消し合って通ってしまう組。ランダム係数で見抜く
+  const D = E2.mul(G2, 42n);
+  const s1 = I.g2ToBytes(E2.add(I.g2FromBytes(items[0].sig), D));
+  const s2 = I.g2ToBytes(E2.add(I.g2FromBytes(items[1].sig), E2.neg(D)));
+  const cancel = items.map((x) => ({ ...x }));
+  cancel[0] = { ...cancel[0], sig: s1 };
+  cancel[1] = { ...cancel[1], sig: s2 };
+  const naiveSum = bls.aggregateSignatures(cancel.map((x) => x.sig));
+  ok("打ち消し合う2件: 素朴な集約だと通ってしまう", bls.aggregateVerify(ms, ks.map((k) => k.publicKey), naiveSum));
+  ok("打ち消し合う2件: verifyBatch は見抜く", !bls.verifyBatch(cancel));
+  ok("verifyBatch 空は false", !bls.verifyBatch([]));
+}
 
 console.log(fail ? `\n${fail} 件失敗` : "\n全部 ok");
 process.exit(fail ? 1 : 0);

@@ -87,6 +87,26 @@ const fpSqrt = (a: bigint): bigint | null => {
   const r = fpPow(a, SQRT_EXP);
   return fpMul(r, r) === a ? r : null;
 };
+// 平方剰余かどうか (ルジャンドル記号) をヤコビ記号の互除法で。冪乗 (約200µs) の 1/8 くらい
+//   1: 平方剰余 / -1: 非剰余 / 0: a ≡ 0
+const fpLegendre = (a: bigint): number => {
+  a = mod(a);
+  let n = P;
+  let t = 1;
+  while (a !== 0n) {
+    while ((a & 1n) === 0n) {
+      a >>= 1n;
+      const r = n & 7n;
+      if (r === 3n || r === 5n) t = -t;
+    }
+    [a, n] = [n, a];
+    if ((a & 3n) === 3n && (n & 3n) === 3n) t = -t;
+    a %= n;
+  }
+  return n === 1n ? t : 0;
+};
+// a^((p-3)/4) = 1/√a (a が平方剰余のとき)。√a と 1/√a が冪乗1回で両方取れる
+const INV_SQRT_EXP = (P - 3n) / 4n;
 
 // ═══ Fp2 = Fp[u]/(u²+1) ═════════════════════════════════════════════
 // f2xxx: 入出力とも還元済み
@@ -126,8 +146,10 @@ const f2pow = (a: Fp2, e: bigint): Fp2 => {
   return r;
 };
 // √(a0 + a1u): ノルム n = a0² + a1² の平方根 s を取って
-//   x0 = √((a0 ± s)/2),  x1 = a1 / (2x0)
-// Fp の平方根 2〜3 回で済む (Fp2 の冪乗よりずっと軽い)
+//   t = (a0 ± s)/2,  x0 = √t,  x1 = a1 / (2x0)
+// 失敗する冪乗をしないように、剰余かどうかは先にルジャンドル記号で判定する
+//   非剰余なら判定 1 回 (約25µs) で終わり。剰余なら 冪乗 2 回 + 判定 2 回
+// さらに y = t^((p-3)/4) = 1/x0 なので x0 = t·y、x1 = a1·y/2 で逆元もいらない
 const INV2 = (P + 1n) / 2n;
 const f2sqrt = (a: Fp2): Fp2 | null => {
   const [a0, a1] = a;
@@ -137,12 +159,16 @@ const f2sqrt = (a: Fp2): Fp2 | null => {
     const t = fpSqrt(fpNeg(a0)); // (t·u)² = -t²
     return t === null ? null : [0n, t];
   }
-  const s = fpSqrt((a0 * a0 + a1 * a1) % P);
-  if (s === null) return null; // ノルムが非剰余 ⇔ a が非剰余
-  let x0 = fpSqrt(fpMul(fpAdd(a0, s), INV2));
-  if (x0 === null) x0 = fpSqrt(fpMul(fpSub(a0, s), INV2));
-  if (x0 === null) return null;
-  return [x0, fpMul(a1, fpInv(x0 << 1n))];
+  const n = (a0 * a0 + a1 * a1) % P;
+  if (fpLegendre(n) !== 1) return null; // ノルムが非剰余 ⇔ a が非剰余
+  const s = fpPow(n, SQRT_EXP);
+  // (a0+s)/2 と (a0-s)/2 の積は -a1²/4 (非剰余) なので、どちらか片方だけが剰余
+  let t = fpMul(fpAdd(a0, s), INV2);
+  if (fpLegendre(t) !== 1) t = fpMul(fpSub(a0, s), INV2);
+  const y = fpPow(t, INV_SQRT_EXP);
+  const x0 = fpMul(t, y);
+  if (fpMul(x0, x0) !== t) return null; // 念のため
+  return [x0, fpMul(fpMul(a1, y), INV2)];
 };
 // RFC 9380 sgn0 (m = 2)
 const f2sgn0 = (a: Fp2): number => {
@@ -701,8 +727,88 @@ const millerLoop = (pairs: Pair[]): Fp12 => {
   return f12conj(f);
 };
 
+// ─── Karabina の圧縮円分二乗 ─────────────────────────────────────────
+// 円分部分群の元は g1, g2, g3, g5 の 4 つ (Fp2) だけで決まる。残りの g0, g4 は後で復元できる
+//   位置: g1 = c0[1], g2 = c0[2], g3 = c1[0], g4 = c1[1], g5 = c1[2], g0 = c0[0]
+// 二乗は Granger–Scott の式のうち g1, g2, g3, g5 の分だけ計算すればいい (Fp2 の二乗 6 回)
+type Cyc4 = [Fp2, Fp2, Fp2, Fp2]; // [g1, g2, g3, g5]
+const cycCompress = (f: Fp12): Cyc4 => [f[0][1], f[0][2], f[1][0], f[1][2]];
+const cycSqrC = (c: Cyc4): Cyc4 => {
+  const [g1, g2, g3, g5] = c;
+  const [B0, B1] = fp4sqU(g3, g2); // g3² + ξg2²,  2g3g2
+  const [C0, C1] = fp4sqU(g1, g5); // g1² + ξg5²,  2g1g5
+  return [m3m2(B0, g1), m3m2(C0, g2), m3p2(u2xi(C1), g3), m3p2(B1, g5)];
+};
+// 復元: g4 = (ξg5² + 3g1² - 2g2) / (4g3)   (g3 = 0 のときは g4 = 2g1g5 / g2)
+//       g0 = ξ(2g4² + g3g5 - 3g1g2) + 1
+// 分母の逆元はまとめて 1 回で (Montgomery のトリック)
+const cycDecompressBatch = (cs: Cyc4[]): Fp12[] => {
+  const nums: Fp2[] = [];
+  const dens: Fp2[] = [];
+  for (const [g1, g2, g3, g5] of cs) {
+    if (!f2isZero(g3)) {
+      const g1s = u2sqr(g1);
+      nums.push(r2(u2sub(u2add(u2xi(u2sqr(g5)), u2add(u2add(g1s, g1s), g1s)), u2add(g2, g2))));
+      dens.push(f2dbl(f2dbl(g3)));
+    } else {
+      nums.push(f2dbl(f2mul(g1, g5)));
+      dens.push(g2);
+    }
+  }
+  // まとめて逆元 (分母が 0 のものは 0 扱い: 単位元など)
+  const n = dens.length;
+  const acc: Fp2[] = new Array(n);
+  let prod = F2_1;
+  for (let i = 0; i < n; i++) {
+    acc[i] = prod;
+    if (!f2isZero(dens[i])) prod = f2mul(prod, dens[i]);
+  }
+  let inv = f2inv(prod);
+  const invs: Fp2[] = new Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    if (f2isZero(dens[i])) {
+      invs[i] = F2_0;
+      continue;
+    }
+    invs[i] = f2mul(inv, acc[i]);
+    inv = f2mul(inv, dens[i]);
+  }
+  return cs.map(([g1, g2, g3, g5], i) => {
+    const g4 = f2mul(nums[i], invs[i]);
+    const g4s = u2sqr(g4);
+    const g12 = u2mul(g1, g2);
+    const inner = u2sub(u2add(u2add(g4s, g4s), u2mul(g3, g5)), u2add(u2add(g12, g12), g12));
+    const g0 = r2(u2add(u2xi(inner), [1n, 0n]));
+    return [
+      [g0, g1, g2],
+      [g3, g4, g5],
+    ];
+  });
+};
+
 // f^x (x < 0)。円分部分群の元に限る
+//   f^|x| = Π f^(2^k) (|x| の立っているビット k について)
+//   f を圧縮したまま 63 回二乗して、必要な 6 個だけまとめて復元して掛ける
+const XBITS_SET: number[] = [];
+for (let k = 0; k < 64; k++) if ((X_ABS >> BigInt(k)) & 1n) XBITS_SET.push(k);
 const cycExp = (f: Fp12): Fp12 => {
+  let c = cycCompress(f);
+  let k = 0;
+  const picks: Cyc4[] = [];
+  for (const pos of XBITS_SET) {
+    while (k < pos) {
+      c = cycSqrC(c);
+      k++;
+    }
+    picks.push(c);
+  }
+  const fs = cycDecompressBatch(picks);
+  let r = fs[0];
+  for (let i = 1; i < fs.length; i++) r = f12mul(r, fs[i]);
+  return f12conj(r);
+};
+// 比較用: 圧縮しない版
+const cycExpGS = (f: Fp12): Fp12 => {
   let r = f;
   for (let i = 1; i < XBITS.length; i++) {
     r = cycSqr(r);
@@ -1095,6 +1201,51 @@ export const fromHex = (h: string): Uint8Array => {
 type BytesLike = Uint8Array | string;
 const bytes = (x: BytesLike) => (typeof x === "string" ? fromHex(x) : x);
 
+// ─── 公開鍵のキャッシュ ───────────────────────────────────────────────
+// 公開鍵の復元 (平方根 + 部分群チェック) は約1ms。同じ公開鍵は何度も来るので、
+// チェックに通った点だけ覚えておく (古いものから捨てる)
+const PK_CACHE = new Map<string, Jac<bigint>>();
+let PK_CACHE_MAX = 4096;
+export const setPublicKeyCacheSize = (n: number) => {
+  PK_CACHE_MAX = n;
+  while (PK_CACHE.size > n) PK_CACHE.delete(PK_CACHE.keys().next().value!);
+};
+const g1FromBytesCached = (b: Uint8Array): Jac<bigint> => {
+  if (PK_CACHE_MAX <= 0) return g1FromBytes(b);
+  const key = toHex(b);
+  const hit = PK_CACHE.get(key);
+  if (hit) return hit;
+  const pt = g1FromBytes(b);
+  PK_CACHE.set(key, pt);
+  if (PK_CACHE.size > PK_CACHE_MAX) PK_CACHE.delete(PK_CACHE.keys().next().value!);
+  return pt;
+};
+
+// バッチ検証用の 64bit の乱数 (0 以外)
+const randScalar64 = (): bigint => {
+  const b = new Uint8Array(8);
+  let r = 0n;
+  while (r === 0n) {
+    globalThis.crypto.getRandomValues(b);
+    r = bytesToBig(b);
+  }
+  return r;
+};
+
+// Σ k_i·P_i を、2倍算を全員で共有してまとめて計算 (Straus / Shamir のトリック)
+//   2倍算は (最大のビット数) 回だけ。P_i は Z=1 (アフィン) なら madd になる
+const msm = <T>(C: Curve<T>, ps: Jac<T>[], ks: bigint[]): Jac<T> => {
+  let bits = 0;
+  for (const k of ks) bits = Math.max(bits, k.toString(2).length);
+  let r = C.inf;
+  for (let b = bits - 1; b >= 0; b--) {
+    r = C.dbl(r);
+    const bb = BigInt(b);
+    for (let i = 0; i < ps.length; i++) if ((ks[i] >> bb) & 1n) r = C.add(r, ps[i]);
+  }
+  return r;
+};
+
 // ═══ BLS 署名 本体 ═════════════════════════════════════════════════
 export class BLS {
   readonly dst: Uint8Array;
@@ -1160,7 +1311,7 @@ export class BLS {
   verify(msg: Uint8Array, pk: BytesLike, sig: BytesLike): boolean {
     this.prof = {};
     try {
-      const P1 = this.step("公開鍵の復元+部分群チェック (G1)", () => g1FromBytes(bytes(pk)));
+      const P1 = this.step("公開鍵の復元+部分群チェック (G1)", () => g1FromBytesCached(bytes(pk)));
       const S = this.step("署名の復元+部分群チェック (G2)", () => g2FromBytes(bytes(sig)));
       if (E1.isInf(P1)) return false;
       const Hm = this.step("H(m) hash-to-G2", () => hashToG2(msg, this.dst));
@@ -1193,7 +1344,7 @@ export class BLS {
     if (pks.length === 0) throw new Error("公開鍵が空");
     let acc = E1.inf;
     for (const p of pks) {
-      const pt = this.step("公開鍵の復元+部分群チェック (G1)", () => g1FromBytes(bytes(p)));
+      const pt = this.step("公開鍵の復元+部分群チェック (G1)", () => g1FromBytesCached(bytes(p)));
       acc = this.step("G1 加算", () => E1.add(acc, pt));
     }
     return this.step("圧縮 (G1)", () => g1ToBytes(acc));
@@ -1212,7 +1363,7 @@ export class BLS {
       const S = this.step("署名の復元+部分群チェック (G2)", () => g2FromBytes(bytes(sig)));
       const pairs: [Jac<bigint>, Jac<Fp2>][] = [[E1.neg(G1), S]];
       for (let i = 0; i < msgs.length; i++) {
-        const Pk = this.step("公開鍵の復元+部分群チェック (G1)", () => g1FromBytes(bytes(pks[i])));
+        const Pk = this.step("公開鍵の復元+部分群チェック (G1)", () => g1FromBytesCached(bytes(pks[i])));
         if (E1.isInf(Pk)) return false;
         pairs.push([Pk, this.step("H(m) hash-to-G2", () => hashToG2(msgs[i], this.dst))]);
       }
@@ -1234,6 +1385,43 @@ export class BLS {
       const ok = this.verify(msg, apk, sig);
       this.prof = { [`公開鍵の集約 (${pks.length}個)`]: aggMs, ...this.prof };
       return ok;
+    } catch {
+      return false;
+    }
+  }
+
+  // 別々の署名をまとめて検証 (バッチ検証)
+  //   ランダムな 64bit の係数 r_i を掛けて
+  //     e(-G1, Σ r_i·σ_i) · Π e(r_i·pk_i, H(m_i)) == 1
+  //   をミラーループ1回 (二乗を共有) + 最終冪1回で確かめる
+  //   1つでも不正な署名が混ざっていれば、確率 1 - 2^-64 で false
+  //   (どれが不正かは分からないので、false なら1個ずつ verify し直す)
+  verifyBatch(items: { msg: Uint8Array; pk: BytesLike; sig: BytesLike }[]): boolean {
+    this.prof = {};
+    try {
+      if (items.length === 0) return false;
+      const rs = items.map(() => randScalar64());
+      const rPks: Jac<bigint>[] = [];
+      const Hs: Jac<Fp2>[] = [];
+      const sigs: Jac<Fp2>[] = [];
+      for (const it of items) {
+        const pk = this.step("公開鍵の復元+部分群チェック (G1)", () => g1FromBytesCached(bytes(it.pk)));
+        if (E1.isInf(pk)) return false;
+        sigs.push(this.step("署名の復元+部分群チェック (G2)", () => g2FromBytes(bytes(it.sig))));
+        Hs.push(this.step("H(m) hash-to-G2", () => hashToG2(it.msg, this.dst)));
+        rPks.push(pk);
+      }
+      const P = this.step("r_i·pk_i (64bit)", () => rPks.map((p, i) => E1.mul(p, rs[i])));
+      const S = this.step("Σ r_i·σ_i (同時倍算)", () => msm(E2, sigs, rs));
+      const pairs: Pair[] = this.step("アフィンにまとめて変換", () => {
+        const pa = E1.toAffineBatch(P);
+        const qa = E2.toAffineBatch(E2.isInf(S) ? Hs : [...Hs, S]);
+        const out: Pair[] = pa.map((p, i) => [p, qa[i]]);
+        if (!E2.isInf(S)) out.push([NEG_G1_AFF, qa[Hs.length]]);
+        return out;
+      });
+      const f = this.step(`ミラーループ (${pairs.length}ペア)`, () => millerLoop(pairs));
+      return f12eq(this.step("最終冪", () => finalExp(f)), F12_1);
     } catch {
       return false;
     }
@@ -1261,6 +1449,9 @@ export const _internal = {
   f12inv,
   f12frob,
   cycSqr,
+  cycExp,
+  cycExpGS,
+  fpLegendre,
   F12_1,
   g1ToBytes,
   g1FromBytes,
@@ -1268,6 +1459,11 @@ export const _internal = {
   g2FromBytes,
   g1InSubgroup,
   g2InSubgroup,
+  g1FromBytesCached,
+  msm,
+  toPairs,
+  NEG_G1_AFF,
+  randScalar64,
   g1MulBase,
   g2MulGLS,
   clearCofactorG2,

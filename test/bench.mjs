@@ -2,7 +2,7 @@
 import { BLS, toHex } from "../dist/bls.js";
 const enc = new TextEncoder();
 const bls = new BLS();
-const N = Number(process.argv[2] ?? 20);
+const N = Number(process.argv[2] ?? 10);
 
 const bench = (label, fn) => {
   for (let i = 0; i < 3; i++) fn(); // ウォームアップ
@@ -28,6 +28,16 @@ const sig = toHex(bls.sign(msg, kp.privateKey));
 bench("鍵生成", () => bls.generateKeyPair());
 bench("署名", () => bls.sign(msg, kp.privateKey));
 bench("検証", () => bls.verify(msg, kp.publicKey, sig));
+
+for (const n of [8, 32]) {
+  const ks = Array.from({ length: n }, () => bls.generateKeyPair());
+  const items = ks.map((k, i) => { const m = enc.encode("tx-" + i); return { msg: m, pk: k.publicKey, sig: bls.sign(m, k.privateKey) }; });
+  const s0 = performance.now();
+  for (const it of items) bls.verify(it.msg, it.pk, it.sig);
+  const one = (performance.now() - s0) / n;
+  bench(`バッチ検証 (${n}件・別々の署名)`, () => bls.verifyBatch(items));
+  console.log(`  比較: 1件ずつ verify すると 1件あたり ${one.toFixed(2)} ms`);
+}
 
 const keys = Array.from({ length: 8 }, () => bls.generateKeyPair());
 const msgs = keys.map((_, i) => enc.encode("msg-" + i));

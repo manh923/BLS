@@ -52,6 +52,13 @@
 <button id="fagg">検証する</button>
 <p>結果: <span id="fagg-result">—</span></p>
 
+<h2>まとめて検証 (速さ比べ)</h2>
+<p>件数 <input id="race-n" size="5" value="32"> <button id="race-gen">署名を作る</button> <span id="race-gen-status"></span></p>
+<p><button id="race-one">1件ずつ verify</button> <span id="race-one-out">—</span></p>
+<p><button id="race-batch">バッチ検証 (1スレッド)</button> <span id="race-batch-out">—</span></p>
+<p><button id="race-pool">バッチ検証 (Worker 並列)</button> <span id="race-pool-out">—</span></p>
+<p><button id="race-bad">1件だけ壊してバッチ検証 (Worker 並列)</button> <span id="race-bad-out">—</span></p>
+
 <script type="module" src="./dist/main.js"></script>
 </body>
 </html>
