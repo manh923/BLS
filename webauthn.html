@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebAuthn 署名</title>
+</head>
+<body>
+<h1>WebAuthn (FIDO2) 署名</h1>
+<p>YubiKey などのセキュリティキーで、決めたチャレンジに署名して、誰でも検証できる形で出す。</p>
+<p>rpId: <code id="rpid"></code> / オリジン: <code id="origin"></code></p>
+<p><a href="./index.html">← BLS署名</a></p>
+
+<h2>1. 登録 (鍵を作る)</h2>
+<p>ユーザー名<br><input id="reg-user" size="40" value="me"></p>
+<button id="reg">キーを登録する</button> <span id="reg-status"></span>
+<p>クレデンシャル ID (base64url)<br><textarea id="reg-id" rows="2" cols="100" readonly></textarea></p>
+<p>アルゴリズム: <span id="reg-alg">—</span> / AAGUID: <span id="reg-aaguid">—</span></p>
+<p>公開鍵 (PEM)<br><textarea id="reg-pem" rows="5" cols="100" readonly></textarea></p>
+<p>attestationObject (base64url。キーの機種の証明が入ってる)<br><textarea id="reg-att" rows="4" cols="100" readonly></textarea></p>
+
+<h2>2. 署名 (チャレンジに署名する)</h2>
+<p>チャレンジ (この文字列の UTF-8 バイト列に署名する。証明したい相手から受け取った文字列を入れる)<br><input id="sign-chal" size="80"></p>
+<p>クレデンシャル ID (base64url)<br><textarea id="sign-id" rows="2" cols="100"></textarea></p>
+<p>公開鍵 (PEM)<br><textarea id="sign-pem" rows="5" cols="100"></textarea></p>
+<button id="sign">キーで署名する</button> <span id="sign-status"></span>
+<p>結果 (これを丸ごと相手に渡す)<br><textarea id="sign-out" rows="14" cols="100" readonly></textarea></p>
+
+<h2>3. 検証 (受け取った結果を確かめる)</h2>
+<p>結果の JSON<br><textarea id="ver-in" rows="14" cols="100"></textarea></p>
+<p>自分が出したチャレンジ<br><input id="ver-chal" size="80"></p>
+<button id="ver">検証する</button>
+<pre id="ver-out">—</pre>
+
+<script type="module" src="./dist/webauthn.js"></script>
+</body>
+</html>
