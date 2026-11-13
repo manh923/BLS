@@ -1098,8 +1098,17 @@ const bytes = (x: BytesLike) => (typeof x === "string" ? fromHex(x) : x);
 // ═══ BLS 署名 本体 ═════════════════════════════════════════════════
 export class BLS {
   readonly dst: Uint8Array;
+  // 直前の呼び出しの内訳 (ms)。cryptos の _prof と同じノリ
+  prof: Record<string, number> = {};
   constructor(readonly dstName: string = DST_NUL) {
     this.dst = new TextEncoder().encode(dstName);
+  }
+
+  private step<T>(name: string, fn: () => T): T {
+    const t = performance.now();
+    const r = fn();
+    this.prof[name] = (this.prof[name] ?? 0) + performance.now() - t;
+    return r;
   }
 
   private skToScalar(sk: BytesLike): bigint {
@@ -1123,7 +1132,10 @@ export class BLS {
 
   // pk = sk·G1
   getPublicKey(sk: BytesLike): Uint8Array {
-    return g1ToBytes(g1MulBase(this.skToScalar(sk)));
+    this.prof = {};
+    const k = this.skToScalar(sk);
+    const pt = this.step("sk·G1 (固定基点テーブル)", () => g1MulBase(k));
+    return this.step("圧縮 (G1)", () => g1ToBytes(pt));
   }
 
   generateKeyPair(): { privateKey: string; publicKey: string } {
@@ -1137,20 +1149,27 @@ export class BLS {
 
   // σ = sk·H(m)
   sign(msg: Uint8Array, sk: BytesLike): Uint8Array {
-    return g2ToBytes(g2MulGLS(hashToG2(msg, this.dst), this.skToScalar(sk)));
+    this.prof = {};
+    const k = this.skToScalar(sk);
+    const Hm = this.step("H(m) hash-to-G2", () => hashToG2(msg, this.dst));
+    const S = this.step("sk·H(m) (GLS)", () => g2MulGLS(Hm, k));
+    return this.step("圧縮 (G2)", () => g2ToBytes(S));
   }
 
   // e(pk, H(m)) == e(G1, σ)  ⇔  e(-G1, σ)·e(pk, H(m)) == 1
   verify(msg: Uint8Array, pk: BytesLike, sig: BytesLike): boolean {
+    this.prof = {};
     try {
-      const P1 = g1FromBytes(bytes(pk));
-      const S = g2FromBytes(bytes(sig));
+      const P1 = this.step("公開鍵の復元+部分群チェック (G1)", () => g1FromBytes(bytes(pk)));
+      const S = this.step("署名の復元+部分群チェック (G2)", () => g2FromBytes(bytes(sig)));
       if (E1.isInf(P1)) return false;
-      const Hm = hashToG2(msg, this.dst);
+      const Hm = this.step("H(m) hash-to-G2", () => hashToG2(msg, this.dst));
       const pairs: Pair[] = [[E1.toAffine(P1)!, E2.toAffine(Hm)!]];
       const Sa = E2.toAffine(S);
       if (Sa) pairs.push([NEG_G1_AFF, Sa]);
-      return f12eq(finalExp(millerLoop(pairs)), F12_1);
+      const f = this.step("ミラーループ (2ペア)", () => millerLoop(pairs));
+      const e = this.step("最終冪", () => finalExp(f));
+      return f12eq(e, F12_1);
     } catch {
       return false;
     }
@@ -1158,37 +1177,48 @@ export class BLS {
 
   // σ_agg = Σ σ_i
   aggregateSignatures(sigs: BytesLike[]): Uint8Array {
+    this.prof = {};
     if (sigs.length === 0) throw new Error("署名が空");
     let acc = E2.inf;
-    for (const s of sigs) acc = E2.add(acc, g2FromBytes(bytes(s)));
-    return g2ToBytes(acc);
+    for (const s of sigs) {
+      const pt = this.step("署名の復元+部分群チェック (G2)", () => g2FromBytes(bytes(s)));
+      acc = this.step("G2 加算", () => E2.add(acc, pt));
+    }
+    return this.step("圧縮 (G2)", () => g2ToBytes(acc));
   }
 
   // pk_agg = Σ pk_i
   aggregatePublicKeys(pks: BytesLike[]): Uint8Array {
+    this.prof = {};
     if (pks.length === 0) throw new Error("公開鍵が空");
     let acc = E1.inf;
-    for (const p of pks) acc = E1.add(acc, g1FromBytes(bytes(p)));
-    return g1ToBytes(acc);
+    for (const p of pks) {
+      const pt = this.step("公開鍵の復元+部分群チェック (G1)", () => g1FromBytes(bytes(p)));
+      acc = this.step("G1 加算", () => E1.add(acc, pt));
+    }
+    return this.step("圧縮 (G1)", () => g1ToBytes(acc));
   }
 
   // 違うメッセージをまとめて検証: e(G1, σ) == Π e(pk_i, H(m_i))
   // (NUL 方式ではメッセージが全部違う必要がある)
   aggregateVerify(msgs: Uint8Array[], pks: BytesLike[], sig: BytesLike): boolean {
+    this.prof = {};
     try {
       if (msgs.length === 0 || msgs.length !== pks.length) return false;
       if (this.dstName === DST_NUL) {
         const seen = new Set(msgs.map(toHex));
         if (seen.size !== msgs.length) return false;
       }
-      const S = g2FromBytes(bytes(sig));
+      const S = this.step("署名の復元+部分群チェック (G2)", () => g2FromBytes(bytes(sig)));
       const pairs: [Jac<bigint>, Jac<Fp2>][] = [[E1.neg(G1), S]];
       for (let i = 0; i < msgs.length; i++) {
-        const Pk = g1FromBytes(bytes(pks[i]));
+        const Pk = this.step("公開鍵の復元+部分群チェック (G1)", () => g1FromBytes(bytes(pks[i])));
         if (E1.isInf(Pk)) return false;
-        pairs.push([Pk, hashToG2(msgs[i], this.dst)]);
+        pairs.push([Pk, this.step("H(m) hash-to-G2", () => hashToG2(msgs[i], this.dst))]);
       }
-      return f12eq(multiPairing(pairs), F12_1);
+      const f = this.step(`ミラーループ (${pairs.length}ペア)`, () => millerLoop(toPairs(pairs)));
+      const e = this.step("最終冪", () => finalExp(f));
+      return f12eq(e, F12_1);
     } catch {
       return false;
     }
@@ -1198,7 +1228,12 @@ export class BLS {
   // ※ rogue key 攻撃があるので本来は POP (所有証明) とセットで使う
   fastAggregateVerify(msg: Uint8Array, pks: BytesLike[], sig: BytesLike): boolean {
     try {
-      return this.verify(msg, this.aggregatePublicKeys(pks), sig);
+      const t = performance.now();
+      const apk = this.aggregatePublicKeys(pks);
+      const aggMs = performance.now() - t;
+      const ok = this.verify(msg, apk, sig);
+      this.prof = { [`公開鍵の集約 (${pks.length}個)`]: aggMs, ...this.prof };
+      return ok;
     } catch {
       return false;
     }

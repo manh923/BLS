@@ -4,7 +4,8 @@
   "description": "BLS署名 (BLS12-381) を bigint だけで",
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node test/test.mjs"
+    "test": "tsc && node test/test.mjs",
+    "bench": "tsc && node test/bench.mjs"
   },
   "repository": {
     "type": "git",
