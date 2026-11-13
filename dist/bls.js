@@ -1,24 +1,47 @@
-// BLS署名 (Boneh–Lynn–Shacham) on BLS12-381
+// BLS署名 (Boneh–Lynn–Shacham) on BLS12-381  ── ゴリゴリ高速化版
 //   - 外部ライブラリなし。bigint だけで全部書く
 //   - 方式: min-pk (公開鍵 G1 48byte / 署名 G2 96byte)。Ethereum とかと同じ並び
 //   - hash-to-curve: RFC 9380 BLS12381G2_XMD:SHA-256_SSWU_RO_
 //   - 圧縮形式: ZCash 形式 (0x80 圧縮 / 0x40 無限遠 / 0x20 y の符号)
+//
+// 高速化メモ
+//   - bigint の % は掛け算の約 2.6 倍重い → 遅延還元 (掛け算は全部やってから最後に1回 %)
+//   - 加減算は % を使わず条件付き引き算/足し算
+//   - ミラーループ: ヤコビアン座標で逆元なし + 疎な掛け算 (014) + 複数ペアで二乗を共有
+//   - 最終冪: hard part を x 乗 5 回に分解 + 円分二乗 (Granger–Scott)
+//   - コファクター除去: ψ 自己準同型 (Budroni–Pintore)
+//   - 部分群チェック: G1 は σ(P) = -[x²]P、G2 は ψ(P) = [x]P (Scott)
+//   - G1 固定基点: ウィンドウ事前計算テーブル
+//   - G2 スカラー倍: GLS (ψ で 4 分割 → 64bit スカラー 4 本の同時倍算)
+//   - Fp2 の平方根: ノルムを使って Fp の平方根 2〜3 回に落とす
 // ─── 定数 ───────────────────────────────────────────────────────────
 const P = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaabn;
 const R = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001n;
-// BLS パラメータ x = -0xd201000000010000 (負)
+// BLS パラメータ x = -0xd201000000010000 (負)。|x| のビット列を使い回す
 const X_ABS = 0xd201000000010000n;
-// G2 の実効コファクター (RFC 9380 8.8.2)
+const XBITS = X_ABS.toString(2);
+// G2 の実効コファクター (テスト用。本体は ψ を使う)
 const H_EFF_G2 = 0xbc69f08f2ee75b3584c6a0ea91b352888e2a8e9145ad7689986ff031508ffe1329c2f178731db956d82bf015d1212b02ec0ec69d7477c1ae954cbc06689f6a359894c0adebbf6b4e8020005aaa95551n;
 export const DST_NUL = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
 export const DST_POP = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 // ═══ Fp ═════════════════════════════════════════════════════════════
-const m = (a) => {
-    const r = a % P;
+// 何でも [0, P) に落とす (負でも 762bit でも OK)
+const mod = (a) => {
+    a %= P;
+    return a < 0n ? a + P : a;
+};
+const fpAdd = (a, b) => {
+    const r = a + b;
+    return r >= P ? r - P : r;
+};
+const fpSub = (a, b) => {
+    const r = a - b;
     return r < 0n ? r + P : r;
 };
+const fpNeg = (a) => (a === 0n ? 0n : P - a);
+const fpMul = (a, b) => (a * b) % P; // a, b ∈ [0, P)
 const fpInv = (a) => {
-    let r0 = P, r1 = m(a);
+    let r0 = P, r1 = mod(a);
     if (r1 === 0n)
         throw new Error("0 の逆元はない");
     let x0 = 0n, x1 = 1n;
@@ -29,84 +52,90 @@ const fpInv = (a) => {
     }
     return x0 < 0n ? x0 + P : x0;
 };
-const powMod = (b, e, mod) => {
-    let r = 1n;
-    b %= mod;
-    if (b < 0n)
-        b += mod;
-    while (e > 0n) {
-        if (e & 1n)
-            r = (r * b) % mod;
-        b = (b * b) % mod;
-        e >>= 1n;
+// 4bit 固定ウィンドウ冪乗 (指数が定数のときに使う)
+const fpPow = (b, e) => {
+    const tbl = [1n, b];
+    for (let i = 2; i < 16; i++)
+        tbl.push(fpMul(tbl[i - 1], b));
+    let hex = e.toString(16);
+    let r = tbl[parseInt(hex[0], 16)];
+    for (let i = 1; i < hex.length; i++) {
+        r = fpMul(r, r);
+        r = fpMul(r, r);
+        r = fpMul(r, r);
+        r = fpMul(r, r);
+        const d = parseInt(hex[i], 16);
+        if (d)
+            r = fpMul(r, tbl[d]);
     }
     return r;
 };
 // p ≡ 3 (mod 4) なので √a = a^((p+1)/4)
+const SQRT_EXP = (P + 1n) / 4n;
 const fpSqrt = (a) => {
-    const r = powMod(a, (P + 1n) / 4n, P);
-    return (r * r) % P === m(a) ? r : null;
-};
-const fpIsSquare = (a) => {
-    a = m(a);
-    return a === 0n || powMod(a, (P - 1n) / 2n, P) === 1n;
+    const r = fpPow(a, SQRT_EXP);
+    return fpMul(r, r) === a ? r : null;
 };
 // ═══ Fp2 = Fp[u]/(u²+1) ═════════════════════════════════════════════
+// f2xxx: 入出力とも還元済み
+// u2xxx: 還元しない (遅延還元用。値は負でも大きくてもいい)
 const F2_0 = [0n, 0n];
 const F2_1 = [1n, 0n];
-const f2 = (a, b = 0n) => [m(a), m(b)];
-const f2add = (a, b) => [m(a[0] + b[0]), m(a[1] + b[1])];
-const f2sub = (a, b) => [m(a[0] - b[0]), m(a[1] - b[1])];
-const f2neg = (a) => [m(-a[0]), m(-a[1])];
+const f2add = (a, b) => [fpAdd(a[0], b[0]), fpAdd(a[1], b[1])];
+const f2sub = (a, b) => [fpSub(a[0], b[0]), fpSub(a[1], b[1])];
+const f2neg = (a) => [fpNeg(a[0]), fpNeg(a[1])];
+const f2dbl = (a) => f2add(a, a);
 const f2mul = (a, b) => {
-    // Karatsuba: 掛け算 3 回
+    // Karatsuba: 掛け算 3 回、% 2 回
     const t0 = a[0] * b[0];
     const t1 = a[1] * b[1];
-    return [m(t0 - t1), m((a[0] + a[1]) * (b[0] + b[1]) - t0 - t1)];
+    return [mod(t0 - t1), ((a[0] + a[1]) * (b[0] + b[1]) - t0 - t1) % P];
 };
 const f2sqr = (a) => [
-    m((a[0] + a[1]) * (a[0] - a[1])),
-    m(2n * a[0] * a[1]),
+    mod((a[0] + a[1]) * (a[0] - a[1])),
+    ((a[0] * a[1]) << 1n) % P,
 ];
-const f2mulFp = (a, k) => [m(a[0] * k), m(a[1] * k)];
-const f2conj = (a) => [a[0], m(-a[1])];
+const f2mulFp = (a, k) => [(a[0] * k) % P, (a[1] * k) % P];
+const f2conj = (a) => [a[0], fpNeg(a[1])];
 const f2inv = (a) => {
     const t = fpInv(a[0] * a[0] + a[1] * a[1]);
-    return [m(a[0] * t), m(-a[1] * t)];
+    return [fpMul(a[0], t), fpMul(fpNeg(a[1]), t)];
 };
 const f2eq = (a, b) => a[0] === b[0] && a[1] === b[1];
 const f2isZero = (a) => a[0] === 0n && a[1] === 0n;
 // ξ = u + 1 を掛ける: (a0 + a1u)(1 + u) = (a0 - a1) + (a0 + a1)u
-const f2mulXi = (a) => [m(a[0] - a[1]), m(a[0] + a[1])];
+const f2mulXi = (a) => [fpSub(a[0], a[1]), fpAdd(a[0], a[1])];
 const f2pow = (a, e) => {
     let r = F2_1;
-    let b = a;
-    while (e > 0n) {
-        if (e & 1n)
-            r = f2mul(r, b);
-        b = f2sqr(b);
-        e >>= 1n;
+    for (const bit of e.toString(2)) {
+        r = f2sqr(r);
+        if (bit === "1")
+            r = f2mul(r, a);
     }
     return r;
 };
-// ノルム a0² + a1² が Fp で平方剰余なら Fp2 でも平方剰余
-const f2isSquare = (a) => fpIsSquare(a[0] * a[0] + a[1] * a[1]);
-// Adj & Rodríguez-Henríquez Algorithm 9 (p ≡ 3 mod 4)
+// √(a0 + a1u): ノルム n = a0² + a1² の平方根 s を取って
+//   x0 = √((a0 ± s)/2),  x1 = a1 / (2x0)
+// Fp の平方根 2〜3 回で済む (Fp2 の冪乗よりずっと軽い)
+const INV2 = (P + 1n) / 2n;
 const f2sqrt = (a) => {
-    if (f2isZero(a))
-        return F2_0;
-    const a1 = f2pow(a, (P - 3n) / 4n);
-    const alpha = f2mul(f2sqr(a1), a);
-    const x0 = f2mul(a1, a);
-    let x;
-    if (f2eq(alpha, [P - 1n, 0n])) {
-        x = [m(-x0[1]), x0[0]]; // u·x0
+    const [a0, a1] = a;
+    if (a1 === 0n) {
+        const s = fpSqrt(a0);
+        if (s !== null)
+            return [s, 0n];
+        const t = fpSqrt(fpNeg(a0)); // (t·u)² = -t²
+        return t === null ? null : [0n, t];
     }
-    else {
-        const b = f2pow(f2add(F2_1, alpha), (P - 1n) / 2n);
-        x = f2mul(b, x0);
-    }
-    return f2eq(f2sqr(x), a) ? x : null;
+    const s = fpSqrt((a0 * a0 + a1 * a1) % P);
+    if (s === null)
+        return null; // ノルムが非剰余 ⇔ a が非剰余
+    let x0 = fpSqrt(fpMul(fpAdd(a0, s), INV2));
+    if (x0 === null)
+        x0 = fpSqrt(fpMul(fpSub(a0, s), INV2));
+    if (x0 === null)
+        return null;
+    return [x0, fpMul(a1, fpInv(x0 << 1n))];
 };
 // RFC 9380 sgn0 (m = 2)
 const f2sgn0 = (a) => {
@@ -115,31 +144,61 @@ const f2sgn0 = (a) => {
     const sign1 = Number(a[1] & 1n);
     return sign0 | (zero0 & sign1);
 };
+const u2mul = (a, b) => {
+    const t0 = a[0] * b[0];
+    const t1 = a[1] * b[1];
+    return [t0 - t1, (a[0] + a[1]) * (b[0] + b[1]) - t0 - t1];
+};
+const u2sqr = (a) => [(a[0] + a[1]) * (a[0] - a[1]), (a[0] * a[1]) << 1n];
+const u2add = (a, b) => [a[0] + b[0], a[1] + b[1]];
+const u2sub = (a, b) => [a[0] - b[0], a[1] - b[1]];
+const u2xi = (a) => [a[0] - a[1], a[0] + a[1]];
+const r2 = (a) => [mod(a[0]), mod(a[1])];
 // ═══ Fp6 = Fp2[v]/(v³-ξ) ════════════════════════════════════════════
 const F6_0 = [F2_0, F2_0, F2_0];
 const F6_1 = [F2_1, F2_0, F2_0];
-const f6add = (a, b) => [
-    f2add(a[0], b[0]),
-    f2add(a[1], b[1]),
-    f2add(a[2], b[2]),
+const u6add = (a, b) => [
+    u2add(a[0], b[0]),
+    u2add(a[1], b[1]),
+    u2add(a[2], b[2]),
 ];
-const f6sub = (a, b) => [
-    f2sub(a[0], b[0]),
-    f2sub(a[1], b[1]),
-    f2sub(a[2], b[2]),
+const u6sub = (a, b) => [
+    u2sub(a[0], b[0]),
+    u2sub(a[1], b[1]),
+    u2sub(a[2], b[2]),
 ];
+const r6 = (a) => [r2(a[0]), r2(a[1]), r2(a[2])];
 const f6neg = (a) => [f2neg(a[0]), f2neg(a[1]), f2neg(a[2])];
-const f6mul = (a, b) => {
-    const t0 = f2mul(a[0], b[0]);
-    const t1 = f2mul(a[1], b[1]);
-    const t2 = f2mul(a[2], b[2]);
-    const c0 = f2add(t0, f2mulXi(f2sub(f2sub(f2mul(f2add(a[1], a[2]), f2add(b[1], b[2])), t1), t2)));
-    const c1 = f2add(f2sub(f2sub(f2mul(f2add(a[0], a[1]), f2add(b[0], b[1])), t0), t1), f2mulXi(t2));
-    const c2 = f2add(f2sub(f2sub(f2mul(f2add(a[0], a[2]), f2add(b[0], b[2])), t0), t2), t1);
-    return [c0, c1, c2];
+// v を掛ける: (b0, b1, b2)·v = (ξ·b2, b0, b1)  (還元済みでも未還元でも使える)
+const f6mulV = (a) => [u2xi(a[2]), a[0], a[1]];
+// Karatsuba (Fp2 掛け算 6 回)。出力は未還元
+const f6mulU = (a, b) => {
+    const t0 = u2mul(a[0], b[0]);
+    const t1 = u2mul(a[1], b[1]);
+    const t2 = u2mul(a[2], b[2]);
+    return [
+        u2add(t0, u2xi(u2sub(u2sub(u2mul(u2add(a[1], a[2]), u2add(b[1], b[2])), t1), t2))),
+        u2add(u2sub(u2sub(u2mul(u2add(a[0], a[1]), u2add(b[0], b[1])), t0), t1), u2xi(t2)),
+        u2add(u2sub(u2sub(u2mul(u2add(a[0], a[2]), u2add(b[0], b[2])), t0), t2), t1),
+    ];
 };
-// v を掛ける: (b0, b1, b2)·v = (ξ·b2, b0, b1)
-const f6mulV = (a) => [f2mulXi(a[2]), a[0], a[1]];
+const f6mul = (a, b) => r6(f6mulU(a, b));
+// a·(b0 + b1·v)  Fp2 掛け算 5 回
+const mulBy01U = (a, b0, b1) => {
+    const t0 = u2mul(a[0], b0);
+    const t1 = u2mul(a[1], b1);
+    return [
+        u2add(t0, u2xi(u2mul(a[2], b1))),
+        u2sub(u2sub(u2mul(u2add(a[0], a[1]), u2add(b0, b1)), t0), t1),
+        u2add(u2mul(a[2], b0), t1),
+    ];
+};
+// a·(b1·v)  Fp2 掛け算 3 回
+const mulBy1U = (a, b1) => [
+    u2xi(u2mul(a[2], b1)),
+    u2mul(a[0], b1),
+    u2mul(a[1], b1),
+];
 const f6inv = (a) => {
     const [a0, a1, a2] = a;
     const c0 = f2sub(f2sqr(a0), f2mulXi(f2mul(a1, a2)));
@@ -150,44 +209,77 @@ const f6inv = (a) => {
 };
 // ═══ Fp12 = Fp6[w]/(w²-v) ═══════════════════════════════════════════
 const F12_1 = [F6_1, F6_0];
+// Karatsuba: Fp6 掛け算 3 回。% は最後に 12 回だけ
 const f12mul = (a, b) => {
-    const t0 = f6mul(a[0], b[0]);
-    const t1 = f6mul(a[1], b[1]);
-    return [
-        f6add(t0, f6mulV(t1)),
-        f6sub(f6sub(f6mul(f6add(a[0], a[1]), f6add(b[0], b[1])), t0), t1),
-    ];
+    const t0 = f6mulU(a[0], b[0]);
+    const t1 = f6mulU(a[1], b[1]);
+    const t2 = f6mulU(u6add(a[0], a[1]), u6add(b[0], b[1]));
+    return [r6(u6add(t0, f6mulV(t1))), r6(u6sub(u6sub(t2, t0), t1))];
 };
+// (a0 + a1w)² = a0² + v·a1² + 2a0a1·w
+//   a0² + v·a1² = (a0 + a1)(a0 + v·a1) - a0a1 - v·a0a1
 const f12sqr = (a) => {
-    // (a0 + a1w)² = a0² + v·a1² + 2a0a1·w
-    const ab = f6mul(a[0], a[1]);
-    const c0 = f6sub(f6sub(f6mul(f6add(a[0], a[1]), f6add(a[0], f6mulV(a[1]))), ab), f6mulV(ab));
-    return [c0, f6add(ab, ab)];
+    const ab = f6mulU(a[0], a[1]);
+    const t = f6mulU(u6add(a[0], a[1]), u6add(a[0], f6mulV(a[1])));
+    return [r6(u6sub(u6sub(t, ab), f6mulV(ab))), r6(u6add(ab, ab))];
+};
+// f · (c0 + c1·v + c4·v·w)  直線の値は3か所しか埋まってないのでそこだけ掛ける
+const f12mul014 = (f, c0, c1, c4) => {
+    const t0 = mulBy01U(f[0], c0, c1);
+    const t1 = mulBy1U(f[1], c4);
+    const t2 = mulBy01U(u6add(f[0], f[1]), c0, u2add(c1, c4));
+    return [r6(u6add(t0, f6mulV(t1))), r6(u6sub(u6sub(t2, t0), t1))];
 };
 const f12conj = (a) => [a[0], f6neg(a[1])];
 const f12inv = (a) => {
-    const t = f6inv(f6sub(f6mul(a[0], a[0]), f6mulV(f6mul(a[1], a[1]))));
+    const t = f6inv(r6(u6sub(f6mulU(a[0], a[0]), f6mulV(f6mulU(a[1], a[1])))));
     return [f6mul(a[0], t), f6neg(f6mul(a[1], t))];
 };
 const f12eq = (a, b) => a.every((c, i) => c.every((d, j) => f2eq(d, b[i][j])));
+// 汎用の冪乗 (テスト用)
 const f12pow = (a, e) => {
     let r = F12_1;
-    const bits = e.toString(2);
-    for (const bit of bits) {
+    for (const bit of e.toString(2)) {
         r = f12sqr(r);
         if (bit === "1")
             r = f12mul(r, a);
     }
     return r;
 };
+// 円分部分群専用の二乗 (Granger–Scott)
+//   Fp12 を Fp4 × 3 と見て、Fp4 の二乗 3 回で済ませる (Fp2 の二乗 9 回)
+const fp4sqU = (a, b) => {
+    const A = u2sqr(a);
+    const B = u2sqr(b);
+    return [u2add(A, u2xi(B)), u2sub(u2sub(u2sqr(u2add(a, b)), A), B)];
+};
+// 3t - 2z / 3t + 2z を1回の % で
+const m3m2 = (t, z) => [
+    mod(3n * t[0] - 2n * z[0]),
+    mod(3n * t[1] - 2n * z[1]),
+];
+const m3p2 = (t, z) => [
+    mod(3n * t[0] + 2n * z[0]),
+    mod(3n * t[1] + 2n * z[1]),
+];
+const cycSqr = (f) => {
+    const z0 = f[0][0], z4 = f[0][1], z3 = f[0][2], z2 = f[1][0], z1 = f[1][1], z5 = f[1][2];
+    const [A0, A1] = fp4sqU(z0, z1);
+    const [B0, B1] = fp4sqU(z2, z3);
+    const [C0, C1] = fp4sqU(z4, z5);
+    return [
+        [m3m2(A0, z0), m3m2(B0, z4), m3m2(C0, z3)],
+        [m3p2(u2xi(C1), z2), m3p2(A1, z1), m3p2(B1, z5)],
+    ];
+};
 // フロベニウス写像 a ↦ a^(p^k)
 //   Fp12 の元を Σ a_i·w^i (i = 0..5, a_i ∈ Fp2) と見ると
 //   (a_i·w^i)^(p^k) = conj^k(a_i) · ξ^(i(p^k-1)/6) · w^i
 //   この ξ^(...) を起動時に計算しておく (ハードコード不要)
 // w^i の位置: i=0→c0[0], 1→c1[0], 2→c0[1], 3→c1[1], 4→c0[2], 5→c1[2]
+const XI = [1n, 1n];
 const FROB = [1, 2, 3].map((k) => {
-    const e = (P ** BigInt(k) - 1n) / 6n;
-    const g = f2pow([1n, 1n], e);
+    const g = f2pow(XI, (P ** BigInt(k) - 1n) / 6n);
     const out = [F2_1];
     for (let i = 1; i < 6; i++)
         out.push(f2mul(out[i - 1], g));
@@ -202,11 +294,11 @@ const f12frob = (a, k) => {
     ];
 };
 const FP = {
-    add: (a, b) => m(a + b),
-    sub: (a, b) => m(a - b),
-    mul: (a, b) => (a * b) % P,
+    add: fpAdd,
+    sub: fpSub,
+    mul: fpMul,
     sqr: (a) => (a * a) % P,
-    neg: (a) => m(-a),
+    neg: fpNeg,
     inv: fpInv,
     isZero: (a) => a === 0n,
     eq: (a, b) => a === b,
@@ -238,10 +330,7 @@ class Curve {
     isInf(p) {
         return this.F.isZero(p[2]);
     }
-    fromAffine(a) {
-        return a ? [a[0], a[1], this.F.one] : this.inf;
-    }
-    // dbl-2009-l (a = 0)
+    // dbl-2009-l (a = 0)  1M + 5S
     dbl(p) {
         const F = this.F;
         const [X, Y, Z] = p;
@@ -253,8 +342,7 @@ class Curve {
         let D = F.sub(F.sub(F.sqr(F.add(X, B)), A), C);
         D = F.add(D, D);
         const E = F.add(F.add(A, A), A);
-        const Fv = F.sqr(E);
-        const X3 = F.sub(Fv, F.add(D, D));
+        const X3 = F.sub(F.sqr(E), F.add(D, D));
         let C8 = F.add(C, C);
         C8 = F.add(C8, C8);
         C8 = F.add(C8, C8);
@@ -262,13 +350,17 @@ class Curve {
         const YZ = F.mul(Y, Z);
         return [X3, Y3, F.add(YZ, YZ)];
     }
-    // add-2007-bl
+    // add-2007-bl  11M + 5S  (q が Z=1 なら madd に回す)
     add(p, q) {
         const F = this.F;
         if (this.isInf(p))
             return q;
         if (this.isInf(q))
             return p;
+        if (F.eq(q[2], F.one))
+            return this.madd(p, q[0], q[1]);
+        if (F.eq(p[2], F.one))
+            return this.madd(q, p[0], p[1]);
         const [X1, Y1, Z1] = p;
         const [X2, Y2, Z2] = q;
         const Z1Z1 = F.sqr(Z1);
@@ -291,9 +383,35 @@ class Curve {
         const Z3 = F.mul(F.sub(F.sub(F.sqr(F.add(Z1, Z2)), Z1Z1), Z2Z2), H);
         return [X3, Y3, Z3];
     }
+    // madd-2007-bl (q はアフィン)  7M + 4S
+    madd(p, x2, y2) {
+        const F = this.F;
+        if (this.isInf(p))
+            return [x2, y2, F.one];
+        const [X1, Y1, Z1] = p;
+        const Z1Z1 = F.sqr(Z1);
+        const U2 = F.mul(x2, Z1Z1);
+        const S2 = F.mul(F.mul(y2, Z1), Z1Z1);
+        const H = F.sub(U2, X1);
+        const rr = F.sub(S2, Y1);
+        if (F.isZero(H))
+            return F.isZero(rr) ? this.dbl(p) : this.inf;
+        const HH = F.sqr(H);
+        let I = F.add(HH, HH);
+        I = F.add(I, I);
+        const J = F.mul(H, I);
+        const r2 = F.add(rr, rr);
+        const V = F.mul(X1, I);
+        const X3 = F.sub(F.sub(F.sqr(r2), J), F.add(V, V));
+        const Y1J = F.mul(Y1, J);
+        const Y3 = F.sub(F.mul(r2, F.sub(V, X3)), F.add(Y1J, Y1J));
+        const Z3 = F.sub(F.sub(F.sqr(F.add(Z1, H)), Z1Z1), HH);
+        return [X3, Y3, Z3];
+    }
     neg(p) {
         return [p[0], this.F.neg(p[1]), p[2]];
     }
+    // 素朴な double-and-add (テストと初期化用)
     mul(p, k) {
         if (k < 0n)
             return this.mul(this.neg(p), -k);
@@ -305,6 +423,20 @@ class Curve {
         }
         return r;
     }
+    // [|x|]P  (|x| は 1 が 6 個しかない)
+    mulAbsX(p) {
+        let r = p;
+        for (let i = 1; i < XBITS.length; i++) {
+            r = this.dbl(r);
+            if (XBITS[i] === "1")
+                r = this.add(r, p);
+        }
+        return r;
+    }
+    // [x]P (x < 0)
+    mulX(p) {
+        return this.neg(this.mulAbsX(p));
+    }
     toAffine(p) {
         const F = this.F;
         if (this.isInf(p))
@@ -313,12 +445,36 @@ class Curve {
         const zi2 = F.sqr(zi);
         return [F.mul(p[0], zi2), F.mul(F.mul(p[1], zi2), zi)];
     }
+    // まとめてアフィンに (逆元 1 回: Montgomery のトリック)
+    toAffineBatch(ps) {
+        const F = this.F;
+        const n = ps.length;
+        if (n === 0)
+            return [];
+        const acc = new Array(n);
+        acc[0] = ps[0][2];
+        for (let i = 1; i < n; i++)
+            acc[i] = F.mul(acc[i - 1], ps[i][2]);
+        let inv = F.inv(acc[n - 1]);
+        const out = new Array(n);
+        for (let i = n - 1; i >= 0; i--) {
+            const zi = i > 0 ? F.mul(inv, acc[i - 1]) : inv;
+            inv = F.mul(inv, ps[i][2]);
+            const zi2 = F.sqr(zi);
+            out[i] = [F.mul(ps[i][0], zi2), F.mul(F.mul(ps[i][1], zi2), zi)];
+        }
+        return out;
+    }
+    // 逆元なしで比較: X1·Z2² == X2·Z1² && Y1·Z2³ == Y2·Z1³
     eq(p, q) {
-        const a = this.toAffine(p);
-        const b = this.toAffine(q);
-        if (!a || !b)
-            return a === b;
-        return this.F.eq(a[0], b[0]) && this.F.eq(a[1], b[1]);
+        const F = this.F;
+        const ip = this.isInf(p), iq = this.isInf(q);
+        if (ip || iq)
+            return ip && iq;
+        const z1z1 = F.sqr(p[2]);
+        const z2z2 = F.sqr(q[2]);
+        return (F.eq(F.mul(p[0], z2z2), F.mul(q[0], z1z1)) &&
+            F.eq(F.mul(F.mul(p[1], z2z2), q[2]), F.mul(F.mul(q[1], z1z1), p[2])));
     }
     isOnCurve(a) {
         if (!a)
@@ -327,8 +483,8 @@ class Curve {
         const [x, y] = a;
         return F.eq(F.sqr(y), F.add(F.mul(F.sqr(x), x), this.b));
     }
-    // r 倍して無限遠になるか (素直な部分群チェック)
-    inSubgroup(p) {
+    // r 倍して無限遠になるか (素朴版。テスト用)
+    inSubgroupSlow(p) {
         return this.isInf(this.mul(p, R));
     }
 }
@@ -352,59 +508,201 @@ const G2 = [
     ],
     F2_1,
 ];
-// ═══ ペアリング (optimal ate) ═══════════════════════════════════════
-// ツイスト上の点 Q' = (x', y') は E 上の (x'/w², y'/w³) に対応する。
-// 傾き λ' の直線を P = (xP, yP) ∈ E(Fp) で評価して w³ 倍すると
-//   l·w³ = (λ'·xT - yT) + (-λ'·xP)·w² + yP·w³
-//        = Fp12( c0 = [λ'xT - yT, -λ'xP, 0], c1 = [0, yP, 0] )
-// (w³ は真部分体の元なので最終冪で消える。垂直線も同様に消える)
-const lineEval = (lambda, xT, yT, xP, yP) => [
-    [f2sub(f2mul(lambda, xT), yT), f2mulFp(f2neg(lambda), xP), F2_0],
-    [F2_0, [yP, 0n], F2_0],
+const NEG_G1_AFF = [G1[0], fpNeg(G1[1])];
+// ─── 自己準同型 ─────────────────────────────────────────────────────
+// ψ = twist ∘ Frobenius ∘ untwist  (G2 上では [x] 倍と同じ)
+//   ψ(x, y) = (conj(x)·ξ^(-(p-1)/3), conj(y)·ξ^(-(p-1)/2))
+const PSI_X = f2inv(f2pow(XI, (P - 1n) / 3n));
+const PSI_Y = f2inv(f2pow(XI, (P - 1n) / 2n));
+const psi = (p) => [
+    f2mul(f2conj(p[0]), PSI_X),
+    f2mul(f2conj(p[1]), PSI_Y),
+    f2conj(p[2]),
 ];
-const millerLoop = (Pa, Qa) => {
-    if (!Pa || !Qa)
-        return F12_1;
-    const [xP, yP] = Pa;
-    const [xQ, yQ] = Qa;
-    let xT = xQ, yT = yQ;
+// σ(x, y) = (β·x, y)  β は 1 の原始 3 乗根。G1 上では [-x²] 倍になる方を選ぶ
+const BETA = (() => {
+    let g = 2n;
+    let b = 1n;
+    while (b === 1n)
+        b = fpPow(g++, (P - 1n) / 3n);
+    const minusX2G1 = E1.neg(E1.mulAbsX(E1.mulAbsX(G1)));
+    for (const cand of [b, fpMul(b, b)])
+        if (E1.eq([fpMul(G1[0], cand), G1[1], 1n], minusX2G1))
+            return cand;
+    throw new Error("β が見つからない");
+})();
+// 部分群チェック (Scott 2021)
+const g1InSubgroup = (p) => E1.eq([fpMul(p[0], BETA), p[1], p[2]], E1.neg(E1.mulAbsX(E1.mulAbsX(p))));
+const g2InSubgroup = (p) => E2.eq(psi(p), E2.mulX(p));
+// ─── G1 固定基点スカラー倍 (ウィンドウ事前計算) ───────────────────
+//   k = Σ d_i·2^(W·i) と分けて、表 T[i][d] = d·2^(W·i)·G1 を足すだけ
+//   倍算ゼロ、加算 (255/W) 回
+const G1_W = 8;
+let G1_TABLE = null;
+const g1Table = () => {
+    if (G1_TABLE)
+        return G1_TABLE;
+    const rows = Math.ceil(255 / G1_W);
+    const size = 1 << G1_W;
+    const flat = [];
+    let base = G1;
+    for (let i = 0; i < rows; i++) {
+        const bAff = E1.toAffine(base);
+        let acc = [bAff[0], bAff[1], 1n];
+        flat.push(acc);
+        for (let d = 2; d < size; d++) {
+            acc = E1.madd(acc, bAff[0], bAff[1]);
+            flat.push(acc);
+        }
+        for (let j = 0; j < G1_W; j++)
+            base = E1.dbl(base);
+    }
+    const aff = E1.toAffineBatch(flat);
+    G1_TABLE = [];
+    for (let i = 0; i < rows; i++)
+        G1_TABLE.push(aff.slice(i * (size - 1), (i + 1) * (size - 1)));
+    return G1_TABLE;
+};
+const g1MulBase = (k) => {
+    const T = g1Table();
+    const mask = BigInt((1 << G1_W) - 1);
+    let r = E1.inf;
+    for (let i = 0; k > 0n; i++, k >>= BigInt(G1_W)) {
+        const d = Number(k & mask);
+        if (d)
+            r = E1.madd(r, T[i][d - 1][0], T[i][d - 1][1]);
+    }
+    return r;
+};
+// ─── G2 スカラー倍 (GLS) ───────────────────────────────────────────
+//   φ = -ψ は G2 上で [|x|] 倍。r < |x|⁴ なので
+//   k = k0 + k1|x| + k2|x|² + k3|x|³ (各 64bit) に分けて
+//   [k]Q = k0·Q + k1·φ(Q) + k2·φ²(Q) + k3·φ³(Q) を同時に計算 (倍算 64 回)
+//   ※ G2 部分群の点にしか使えない
+const g2MulGLS = (q, k) => {
+    k %= R;
+    if (k < 0n)
+        k += R;
+    if (k === 0n || E2.isInf(q))
+        return E2.inf;
+    const ks = [];
+    for (let i = 0; i < 4; i++) {
+        ks.push(k % X_ABS);
+        k /= X_ABS;
+    }
+    const phi = (p) => E2.neg(psi(p));
+    const base = [q];
+    for (let i = 1; i < 4; i++)
+        base.push(phi(base[i - 1]));
+    // 16 通りの部分和を作ってアフィンに揃える
+    const sums = [E2.inf];
+    for (let m = 1; m < 16; m++) {
+        const low = m & -m;
+        sums.push(E2.add(sums[m ^ low], base[31 - Math.clz32(low)]));
+    }
+    const nz = sums.slice(1).map((p, i) => [p, i + 1]).filter(([p]) => !E2.isInf(p));
+    const aff = E2.toAffineBatch(nz.map(([p]) => p));
+    const tbl = new Array(16).fill(null);
+    nz.forEach(([, m], i) => (tbl[m] = aff[i]));
+    let r = E2.inf;
+    for (let bit = 63; bit >= 0; bit--) {
+        r = E2.dbl(r);
+        const b = BigInt(bit);
+        const idx = Number((ks[0] >> b) & 1n) |
+            (Number((ks[1] >> b) & 1n) << 1) |
+            (Number((ks[2] >> b) & 1n) << 2) |
+            (Number((ks[3] >> b) & 1n) << 3);
+        const t = tbl[idx];
+        if (t)
+            r = E2.madd(r, t[0], t[1]);
+    }
+    return r;
+};
+const millerLoop = (pairs) => {
+    const n = pairs.length;
+    const T = pairs.map(([, q]) => [q[0], q[1], F2_1]);
     let f = F12_1;
-    const bits = X_ABS.toString(2);
-    for (let i = 1; i < bits.length; i++) {
-        // 接線 (T + T)
-        const lam = f2mul(f2mulFp(f2sqr(xT), 3n), f2inv(f2add(yT, yT)));
-        f = f12mul(f12sqr(f), lineEval(lam, xT, yT, xP, yP));
-        const x3 = f2sub(f2sqr(lam), f2add(xT, xT));
-        yT = f2sub(f2mul(lam, f2sub(xT, x3)), yT);
-        xT = x3;
-        if (bits[i] === "1") {
-            // 割線 (T + Q)
-            const lam2 = f2mul(f2sub(yQ, yT), f2inv(f2sub(xQ, xT)));
-            f = f12mul(f, lineEval(lam2, xT, yT, xP, yP));
-            const x4 = f2sub(f2sub(f2sqr(lam2), xT), xQ);
-            yT = f2sub(f2mul(lam2, f2sub(xT, x4)), yT);
-            xT = x4;
+    for (let i = 1; i < XBITS.length; i++) {
+        if (i > 1)
+            f = f12sqr(f); // 二乗は全ペアで共有
+        for (let j = 0; j < n; j++) {
+            const [xP, yP] = pairs[j][0];
+            const [X, Y, Z] = T[j];
+            const XX = f2sqr(X);
+            const YY = f2sqr(Y);
+            const ZZ = f2sqr(Z);
+            const C = f2sqr(YY);
+            const E = f2add(f2add(XX, XX), XX);
+            const D = f2dbl(f2sub(f2sub(f2sqr(f2add(X, YY)), XX), C));
+            const X3 = f2sub(f2sqr(E), f2dbl(D));
+            const Y3 = f2sub(f2mul(E, f2sub(D, X3)), f2dbl(f2dbl(f2dbl(C))));
+            const Z3 = f2dbl(f2mul(Y, Z));
+            T[j] = [X3, Y3, Z3];
+            f = f12mul014(f, f2sub(f2mul(E, X), f2dbl(YY)), f2mulFp(f2neg(f2mul(E, ZZ)), xP), f2mulFp(f2mul(Z3, ZZ), yP));
+        }
+        if (XBITS[i] === "1") {
+            for (let j = 0; j < n; j++) {
+                const [xP, yP] = pairs[j][0];
+                const [xQ, yQ] = pairs[j][1];
+                const [X, Y, Z] = T[j];
+                const ZZ = f2sqr(Z);
+                const U2 = f2mul(xQ, ZZ);
+                const S2 = f2mul(f2mul(yQ, Z), ZZ);
+                const H = f2sub(U2, X);
+                const HH = f2sqr(H);
+                const I = f2dbl(f2dbl(HH));
+                const J = f2mul(H, I);
+                const rr = f2dbl(f2sub(S2, Y));
+                const V = f2mul(X, I);
+                const X3 = f2sub(f2sub(f2sqr(rr), J), f2dbl(V));
+                const Y3 = f2sub(f2mul(rr, f2sub(V, X3)), f2dbl(f2mul(Y, J)));
+                const Z3 = f2sub(f2sub(f2sqr(f2add(Z, H)), ZZ), HH);
+                T[j] = [X3, Y3, Z3];
+                f = f12mul014(f, f2sub(f2mul(rr, xQ), f2mul(yQ, Z3)), f2mulFp(f2neg(rr), xP), f2mulFp(Z3, yP));
+            }
         }
     }
     // x < 0 なので共役を取る
     return f12conj(f);
 };
-// 最終冪 f^((p¹²-1)/r)
-//   easy: (p⁶-1)(p²+1)  hard: (p⁴-p²+1)/r
-const HARD_EXP = (P ** 4n - P ** 2n + 1n) / R;
+// f^x (x < 0)。円分部分群の元に限る
+const cycExp = (f) => {
+    let r = f;
+    for (let i = 1; i < XBITS.length; i++) {
+        r = cycSqr(r);
+        if (XBITS[i] === "1")
+            r = f12mul(r, f);
+    }
+    return f12conj(r);
+};
+// 最終冪 f^(3(p¹²-1)/r)
+//   easy: (p⁶-1)(p²+1)
+//   hard: 3(p⁴-p²+1)/r = λ0 + λ1·p + λ2·p² + λ3·p³
+//         λ3 = (x-1)², λ2 = λ3·x, λ1 = λ2·x - λ3, λ0 = λ1·x + 3
+//   (3 倍してあるけど r と互いに素なのでペアリングとしては問題なし)
 const finalExp = (f) => {
     let t = f12mul(f12conj(f), f12inv(f)); // f^(p⁶-1)
-    t = f12mul(f12frob(t, 2), t); // ^(p²+1)
-    return f12pow(t, HARD_EXP);
+    t = f12mul(f12frob(t, 2), t); // ^(p²+1)  ここから円分部分群
+    const a = f12mul(cycExp(t), f12conj(t)); // t^(x-1)
+    const A3 = f12mul(cycExp(a), f12conj(a)); // t^λ3
+    const A2 = cycExp(A3); // t^λ2
+    const A1 = f12mul(cycExp(A2), f12conj(A3)); // t^λ1
+    const A0 = f12mul(f12mul(cycExp(A1), cycSqr(t)), t); // t^λ0
+    return f12mul(f12mul(A0, f12frob(A1, 1)), f12mul(f12frob(A2, 2), f12frob(A3, 3)));
 };
-const pairing = (Pp, Qp) => finalExp(millerLoop(E1.toAffine(Pp), E2.toAffine(Qp)));
-// Π e(P_i, Q_i) をまとめて計算 (最終冪は1回)
-const multiPairing = (pairs) => {
-    let f = F12_1;
-    for (const [Pp, Qp] of pairs)
-        f = f12mul(f, millerLoop(E1.toAffine(Pp), E2.toAffine(Qp)));
-    return finalExp(f);
+const toPairs = (pairs) => {
+    const out = [];
+    for (const [p, q] of pairs) {
+        const a = E1.toAffine(p);
+        const b = E2.toAffine(q);
+        if (a && b)
+            out.push([a, b]); // 無限遠を含むペアは 1
+    }
+    return out;
 };
+const pairing = (p, q) => finalExp(millerLoop(toPairs([[p, q]])));
+// Π e(P_i, Q_i)  ミラーループの二乗と最終冪を共有
+const multiPairing = (pairs) => finalExp(millerLoop(toPairs(pairs)));
 // ═══ SHA-256 ═══════════════════════════════════════════════════════
 const K256 = new Uint32Array([
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
@@ -419,6 +717,7 @@ const K256 = new Uint32Array([
     0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ]);
+const SHA_W = new Uint32Array(64);
 export const sha256 = (msg) => {
     const len = msg.length;
     const total = (((len + 9 + 63) >> 6) << 6) >>> 0;
@@ -432,7 +731,7 @@ export const sha256 = (msg) => {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
         0x1f83d9ab, 0x5be0cd19,
     ]);
-    const W = new Uint32Array(64);
+    const W = SHA_W;
     const rotr = (x, n) => (x >>> n) | (x << (32 - n));
     for (let off = 0; off < total; off += 64) {
         for (let i = 0; i < 16; i++)
@@ -527,7 +826,7 @@ export const expandMessageXmd = (msg, dst, lenInBytes) => {
 const hashToFieldFp2 = (msg, dst) => {
     const L = 64;
     const bytes = expandMessageXmd(msg, dst, 2 * 2 * L);
-    const e = (k) => m(bytesToBig(bytes.subarray(k * L, (k + 1) * L)));
+    const e = (k) => bytesToBig(bytes.subarray(k * L, (k + 1) * L)) % P;
     return [
         [e(0), e(1)],
         [e(2), e(3)],
@@ -536,30 +835,22 @@ const hashToFieldFp2 = (msg, dst) => {
 // 6.6.2 Simplified SWU on E2': y² = x³ + A'x + B'
 const SSWU_A = [0n, 240n];
 const SSWU_B = [1012n, 1012n];
-const SSWU_Z = f2(-2n, -1n);
+const SSWU_Z = [P - 2n, P - 1n];
+const SSWU_MB_A = f2mul(f2neg(SSWU_B), f2inv(SSWU_A)); // -B/A
+const SSWU_B_ZA = f2mul(SSWU_B, f2inv(f2mul(SSWU_Z, SSWU_A))); // B/(ZA)
+const sswuG = (x) => f2add(f2mul(f2add(f2sqr(x), SSWU_A), x), SSWU_B); // x³ + Ax + B
 const mapToCurveSSWU = (u) => {
-    const A = SSWU_A, B = SSWU_B, Z = SSWU_Z;
-    const u2 = f2sqr(u);
-    const zu2 = f2mul(Z, u2);
+    const zu2 = f2mul(SSWU_Z, f2sqr(u));
     const den = f2add(f2sqr(zu2), zu2); // Z²u⁴ + Zu²
-    let x1;
-    if (f2isZero(den)) {
-        x1 = f2mul(B, f2inv(f2mul(Z, A)));
-    }
-    else {
-        const tv1 = f2inv(den);
-        x1 = f2mul(f2mul(f2neg(B), f2inv(A)), f2add(F2_1, tv1));
-    }
-    const g = (x) => f2add(f2add(f2mul(f2sqr(x), x), f2mul(A, x)), B);
-    const gx1 = g(x1);
-    let x, y;
-    if (f2isSquare(gx1)) {
-        x = x1;
-        y = f2sqrt(gx1);
-    }
-    else {
+    const x1 = f2isZero(den)
+        ? SSWU_B_ZA
+        : f2mul(SSWU_MB_A, f2add(F2_1, f2inv(den)));
+    // gx1 が平方剰余なら x1、ダメなら x2 = Zu²·x1 (どっちかは必ず剰余)
+    let x = x1;
+    let y = f2sqrt(sswuG(x1));
+    if (y === null) {
         x = f2mul(zu2, x1);
-        y = f2sqrt(g(x));
+        y = f2sqrt(sswuG(x));
     }
     if (f2sgn0(u) !== f2sgn0(y))
         y = f2neg(y);
@@ -630,23 +921,38 @@ const ISO = [
         [1n, 0n],
     ],
 ];
+// 結果を分数のままヤコビアンに入れて逆元を消す
+//   Z = xD·yD,  X = xN·xD·yD²,  Y = y·yN·xD³·yD²
 const isoMap = (x, y) => {
-    // ホーナー法 (高次から)
     const ev = (k) => k.reduceRight((acc, c) => f2add(f2mul(acc, x), c), F2_0);
-    const [xNum, xDen, yNum, yDen] = ISO.map(ev);
-    if (f2isZero(xDen) || f2isZero(yDen))
+    const [xN, xD, yN, yD] = ISO.map(ev);
+    if (f2isZero(xD) || f2isZero(yD))
         return E2.inf;
+    const Z = f2mul(xD, yD);
+    const yD2 = f2sqr(yD);
+    const xD2 = f2sqr(xD);
     return [
-        f2mul(xNum, f2inv(xDen)),
-        f2mul(y, f2mul(yNum, f2inv(yDen))),
-        F2_1,
+        f2mul(f2mul(xN, xD), yD2),
+        f2mul(f2mul(f2mul(y, yN), f2mul(xD2, xD)), yD2),
+        Z,
     ];
+};
+// RFC 9380 G.3 (Budroni–Pintore): h_eff 倍を ψ と [x] 倍 2 回で
+const clearCofactorG2 = (p) => {
+    const t1 = E2.mulX(p);
+    let t2 = psi(p);
+    let t3 = psi(psi(E2.dbl(p)));
+    t3 = E2.add(t3, E2.neg(t2));
+    t2 = E2.mulX(E2.add(t1, t2));
+    t3 = E2.add(t3, t2);
+    t3 = E2.add(t3, E2.neg(t1));
+    return E2.add(t3, E2.neg(p));
 };
 export const hashToG2 = (msg, dst) => {
     const [u0, u1] = hashToFieldFp2(msg, dst);
     const q0 = isoMap(...mapToCurveSSWU(u0));
     const q1 = isoMap(...mapToCurveSSWU(u1));
-    return E2.mul(E2.add(q0, q1), H_EFF_G2);
+    return clearCofactorG2(E2.add(q0, q1));
 };
 // ═══ シリアライズ (ZCash 圧縮形式) ═════════════════════════════════
 const HALF_P = (P - 1n) / 2n;
@@ -679,13 +985,13 @@ const g1FromBytes = (b) => {
     }
     if (x >= P)
         throw new Error("x が p 以上");
-    let y = fpSqrt(m(x * x * x + 4n));
+    let y = fpSqrt(mod(x * x * x + 4n));
     if (y === null)
         throw new Error("曲線上にない");
     if (y > HALF_P !== !!(flags & 0x20))
         y = P - y;
     const pt = [x, y, 1n];
-    if (!E1.inSubgroup(pt))
+    if (!g1InSubgroup(pt))
         throw new Error("G1 部分群にない");
     return pt;
 };
@@ -729,7 +1035,7 @@ const g2FromBytes = (b) => {
     if (f2lexLarge(y) !== !!(flags & 0x20))
         y = f2neg(y);
     const pt = [x, y, F2_1];
-    if (!E2.inSubgroup(pt))
+    if (!g2InSubgroup(pt))
         throw new Error("G2 部分群にない");
     return pt;
 };
@@ -774,7 +1080,7 @@ export class BLS {
     }
     // pk = sk·G1
     getPublicKey(sk) {
-        return g1ToBytes(E1.mul(G1, this.skToScalar(sk)));
+        return g1ToBytes(g1MulBase(this.skToScalar(sk)));
     }
     generateKeyPair() {
         const sk = this.generatePrivateKey();
@@ -785,7 +1091,7 @@ export class BLS {
     }
     // σ = sk·H(m)
     sign(msg, sk) {
-        return g2ToBytes(E2.mul(hashToG2(msg, this.dst), this.skToScalar(sk)));
+        return g2ToBytes(g2MulGLS(hashToG2(msg, this.dst), this.skToScalar(sk)));
     }
     // e(pk, H(m)) == e(G1, σ)  ⇔  e(-G1, σ)·e(pk, H(m)) == 1
     verify(msg, pk, sig) {
@@ -795,11 +1101,11 @@ export class BLS {
             if (E1.isInf(P1))
                 return false;
             const Hm = hashToG2(msg, this.dst);
-            const r = multiPairing([
-                [E1.neg(G1), S],
-                [P1, Hm],
-            ]);
-            return f12eq(r, F12_1);
+            const pairs = [[E1.toAffine(P1), E2.toAffine(Hm)]];
+            const Sa = E2.toAffine(S);
+            if (Sa)
+                pairs.push([NEG_G1_AFF, Sa]);
+            return f12eq(finalExp(millerLoop(pairs)), F12_1);
         }
         catch {
             return false;
@@ -867,18 +1173,34 @@ export const _internal = {
     E2,
     G1,
     G2,
+    H_EFF_G2,
     pairing,
     multiPairing,
     millerLoop,
     finalExp,
     f12eq,
     f12mul,
+    f12sqr,
     f12pow,
+    f12conj,
+    f12inv,
+    f12frob,
+    cycSqr,
     F12_1,
     g1ToBytes,
     g1FromBytes,
     g2ToBytes,
     g2FromBytes,
+    g1InSubgroup,
+    g2InSubgroup,
+    g1MulBase,
+    g2MulGLS,
+    clearCofactorG2,
     hashToG2,
-    HARD_EXP,
+    isoMap,
+    mapToCurveSSWU,
+    f2sqrt,
+    f2sqr,
+    psi,
+    HARD_EXP: (P ** 4n - P ** 2n + 1n) / R,
 };

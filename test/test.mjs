@@ -19,11 +19,44 @@ const { E1, E2, G1, G2, P, R } = I;
 ok("HARD_EXP は割り切れる", (P ** 4n - P ** 2n + 1n) % R === 0n);
 ok("G1 は曲線上", E1.isOnCurve(E1.toAffine(G1)));
 ok("G2 は曲線上", E2.isOnCurve(E2.toAffine(G2)));
-ok("r·G1 = O", E1.inSubgroup(G1));
-ok("r·G2 = O", E2.inSubgroup(G2));
+ok("r·G1 = O", E1.inSubgroupSlow(G1));
+ok("r·G2 = O", E2.inSubgroupSlow(G2));
+
+// ─── 高速化した部品を素朴版と突き合わせる ───
+const rnd = () => { const b = new Uint8Array(48); crypto.getRandomValues(b); let r = 0n; for (const x of b) r = (r << 8n) | BigInt(x); return r; };
+{
+  // 円分二乗 = 普通の二乗 (円分部分群の元で)
+  const f0 = I.millerLoop([[E1.toAffine(G1), E2.toAffine(G2)]]);
+  let t = I.f12mul(I.f12conj(f0), I.f12inv(f0));
+  t = I.f12mul(I.f12frob(t, 2), t);
+  ok("cycSqr = f12sqr (円分部分群)", I.f12eq(I.cycSqr(t), I.f12sqr(t)));
+  // 最終冪 = 素朴版の 3 乗
+  const slow = I.f12pow(t, I.HARD_EXP);
+  ok("finalExp = (素朴な最終冪)^3", I.f12eq(I.finalExp(f0), I.f12mul(I.f12mul(slow, slow), slow)));
+}
+for (let i = 0; i < 3; i++) {
+  const k = rnd() % R;
+  ok(`g1MulBase = 素朴なスカラー倍 #${i}`, E1.eq(I.g1MulBase(k), E1.mul(G1, k)));
+  ok(`g2MulGLS = 素朴なスカラー倍 #${i}`, E2.eq(I.g2MulGLS(G2, k), E2.mul(G2, k)));
+  // 部分群に入ってない曲線上の点
+  let p1; for (let x = rnd() % P; ; x++) { const y = I.f2sqrt([(x * x * x + 4n) % P, 0n]); if (y && y[1] === 0n) { p1 = [x, y[0], 1n]; break; } }
+  ok(`G1 部分群チェック (外の点) #${i}`, I.g1InSubgroup(p1) === E1.inSubgroupSlow(p1) && !I.g1InSubgroup(p1));
+  const in1 = E1.mul(p1, 0x396c8c005555e1568c00aaab0000aaabn); // cofactor h1
+  ok(`G1 部分群チェック (中の点) #${i}`, I.g1InSubgroup(in1) && E1.inSubgroupSlow(in1));
+  let p2; for (let x0 = rnd() % P; ; x0++) { const x = [x0, 1n]; const y = I.f2sqrt(I.E2.F.add(I.E2.F.mul(I.f2sqr(x), x), [4n, 4n])); if (y) { p2 = [x, y, [1n, 0n]]; break; } }
+  ok(`G2 部分群チェック (外の点) #${i}`, I.g2InSubgroup(p2) === E2.inSubgroupSlow(p2) && !I.g2InSubgroup(p2));
+  const cc = I.clearCofactorG2(p2);
+  ok(`clearCofactor(ψ版) = h_eff 倍 #${i}`, E2.eq(cc, E2.mul(p2, I.H_EFF_G2)));
+  ok(`G2 部分群チェック (中の点) #${i}`, I.g2InSubgroup(cc) && E2.inSubgroupSlow(cc));
+}
 
 // ペアリングの双線形性
 const e = t("pairing", () => I.pairing(G1, G2));
+{
+  const ne = nb.pairing(nb.G1.ProjectivePoint.BASE, nb.G2.ProjectivePoint.BASE);
+  const flat = (f) => [f.c0.c0.c0, f.c0.c0.c1, f.c0.c1.c0, f.c0.c1.c1, f.c0.c2.c0, f.c0.c2.c1, f.c1.c0.c0, f.c1.c0.c1, f.c1.c1.c0, f.c1.c1.c1, f.c1.c2.c0, f.c1.c2.c1];
+  ok("e(G1,G2) = noble の pairing", flat(ne).join() === e.flat(2).join());
+}
 ok("e(G1,G2) ≠ 1", !I.f12eq(e, I.F12_1));
 ok("e(G1,G2)^r = 1", I.f12eq(I.f12pow(e, R), I.F12_1));
 const a = 123456789n, b = 987654321n;
