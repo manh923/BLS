@@ -1,0 +1,22 @@
+{
+  "name": "bls",
+  "version": "1.0.0",
+  "description": "BLS署名 (BLS12-381) を bigint だけで",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node test/test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/manh923/BLS.git"
+  },
+  "bugs": {
+    "url": "https://github.com/manh923/BLS/issues"
+  },
+  "homepage": "https://github.com/manh923/BLS#readme",
+  "devDependencies": {
+    "@noble/curves": "^1.9.7",
+    "typescript": "^5.9.3"
+  },
+  "type": "module"
+}
