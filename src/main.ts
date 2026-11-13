@@ -1,5 +1,6 @@
 import { BLS, toHex } from "./bls.js";
 import { BLSPool } from "./bls-pool.js";
+import { BLSWasm } from "./bls-wasm.js";
 
 const bls = new BLS();
 const enc = new TextEncoder();
@@ -144,3 +145,12 @@ race("race-bad", "race-bad-out", "1件だけ壊してバッチ検証", async () 
   console.log(`${j} 番目のメッセージを改ざん`);
   return p.verifyBatch(bad);
 });
+
+// Rust → WASM 版
+let wasm: BLSWasm | null = null;
+const getWasm = async () => (wasm ??= await BLSWasm.load());
+race("race-wasm-one", "race-wasm-one-out", "1件ずつ verify (WASM)", async () => {
+  const w = await getWasm();
+  return raceItems.every((it) => w.verify(it.msg, it.pk, it.sig));
+});
+race("race-wasm-batch", "race-wasm-batch-out", "バッチ検証 (WASM)", async () => (await getWasm()).verifyBatch(raceItems));

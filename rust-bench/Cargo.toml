@@ -1,0 +1,20 @@
+[package]
+name = "bls-bench"
+version = "0.1.0"
+edition = "2021"
+description = "自前の Rust 版と blst の速さ比べ (ネイティブ / WASM)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+blst = "0.3"
+bls12381 = { path = "../rust" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
