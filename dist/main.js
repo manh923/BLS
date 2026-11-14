@@ -1,5 +1,6 @@
 import { BLS, toHex } from "./bls.js";
 import { BLSPool } from "./bls-pool.js";
+import * as L from "./lattice.js";
 // UI は cryptos の「ECでシュノアしたら速くなるんじゃね？」と同じ作り
 (() => {
     const enc = new TextEncoder();
@@ -361,6 +362,44 @@ import { BLSPool } from "./bls-pool.js";
             console.log(`${j} 番目のメッセージを改ざん`);
             return (await getPool()).verifyBatch(bad);
         }, () => pool?.prof ?? {});
+    });
+    // ── lattice (格子署名をどこまで小さくできるか) ──
+    addTab("lattice", (p) => {
+        p.classList.add("ct-keep-case");
+        note(p, "格子署名の研究ごっこ。ML-DSA-44 と同じ格子 (n=256, q=8380417, k=l=4) で、縮める技を 1 段ずつ足した版を比べる。※ おもちゃ (定数時間ではない、ハッシュは SHA-256 で代用)");
+        const desc = el("div", "ct-output");
+        desc.textContent = L.VARIANTS.map((v) => `${v.name}\n  ${v.desc}`).join("\n");
+        p.appendChild(el("div", "ct-field")).appendChild(desc);
+        const n = addField(p, "各版の署名回数", mkInput("10", "10"));
+        const out = addOutput(p, "結果 (サイズはバイト)");
+        addBtn(p, "全部の版で測る", "格子署名の比較", async () => {
+            const times = Math.max(1, Number(n.value) || 10);
+            const lines = [];
+            out.textContent = "計算中...";
+            for (const P of L.VARIANTS) {
+                const { pk, sk } = L.keygen(P);
+                let size = 0, att = 0, ts = 0, tv = 0, ok = true;
+                for (let i = 0; i < times; i++) {
+                    const m = enc.encode(`${P.id}-${i}-${Math.random()}`);
+                    let t0 = performance.now();
+                    const sig = L.sign(sk, m);
+                    ts += performance.now() - t0;
+                    att += L.lastAttempts;
+                    t0 = performance.now();
+                    ok &&= L.verify(P, pk, m, sig);
+                    tv += performance.now() - t0;
+                    size += sig.length;
+                }
+                const s = Math.round(size / times);
+                lines.push(`${ok ? "✓" : "✗ 検証失敗"} ${P.name}`, `   署名 ${s}B  公開鍵 ${pk.length}B  合計 ${s + pk.length}B  /  やり直し ${(att / times).toFixed(1)} 回  署名 ${(ts / times).toFixed(1)} ms  検証 ${(tv / times).toFixed(1)} ms`);
+                out.textContent = lines.join("\n");
+                await new Promise((r) => setTimeout(r, 0)); // 1 版ずつ表示を更新
+            }
+            const v2 = L.VARIANTS.find((v) => v.id === "V2");
+            if (v2)
+                lines.push("", "V2 = ML-DSA-44 と同じ形 (署名 2420B / 公開鍵 1312B) を基準に、V3・V4 でどこまで縮んだかを見る");
+            out.textContent = lines.join("\n");
+        }, () => ({}));
     });
     // 最初のタブをアクティブに
     tabs[0]?.classList.add("active");
