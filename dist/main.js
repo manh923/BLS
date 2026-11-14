@@ -1,6 +1,8 @@
 import { BLS, toHex } from "./bls.js";
 import { BLSPool } from "./bls-pool.js";
 import * as L from "./lattice.js";
+import { Dilithium2 } from "./dilithium/Dilithium2.js";
+import { Dilithium2Small } from "./dilithium/Dilithium2Small.js";
 // UI は cryptos の「ECでシュノアしたら速くなるんじゃね？」と同じ作り
 (() => {
     const enc = new TextEncoder();
@@ -399,6 +401,37 @@ import * as L from "./lattice.js";
             if (v2)
                 lines.push("", "V2 = ML-DSA-44 と同じ形 (署名 2420B / 公開鍵 1312B) を基準に、V3・V4 でどこまで縮んだかを見る");
             out.textContent = lines.join("\n");
+        }, () => ({}));
+        step(p, "cryptos の Dilithium2 を改造して比べる");
+        note(p, "cryptos の Dilithium2 をコピーして、y をガウス分布・z をライス符号にした版と比べる (bigint なので少し遅い)");
+        const dOut = addOutput(p, "結果 (サイズはバイト)");
+        addBtn(p, "Dilithium2 で比べる", "Dilithium2 の比較", async () => {
+            const times = Math.max(1, Number(n.value) || 10);
+            const lines = [];
+            const list = [
+                ["元の Dilithium2 (cryptos)", new Dilithium2()],
+                ["改造版 η=2 (ガウス + ライス符号)", new Dilithium2Small({ eta: 2 })],
+                ["改造版 η=1", new Dilithium2Small({ eta: 1 })],
+            ];
+            dOut.textContent = "計算中...";
+            for (const [name, d] of list) {
+                const { pk, sk } = d.keyGen();
+                let size = 0, ts = 0, tv = 0, ok = true;
+                for (let i = 0; i < times; i++) {
+                    const m = enc.encode(`${name}-${i}-${Math.random()}`);
+                    let t0 = performance.now();
+                    const sig = d.sign(sk, m);
+                    ts += performance.now() - t0;
+                    t0 = performance.now();
+                    ok &&= d.verify(pk, m, sig);
+                    tv += performance.now() - t0;
+                    size += sig.length;
+                }
+                const s = Math.round(size / times);
+                lines.push(`${ok ? "✓" : "✗ 検証失敗"} ${name}`, `   署名 ${s}B  公開鍵 ${pk.length}B  /  署名 ${(ts / times).toFixed(0)} ms  検証 ${(tv / times).toFixed(0)} ms`);
+                dOut.textContent = lines.join("\n");
+                await new Promise((r) => setTimeout(r, 0));
+            }
         }, () => ({}));
     });
     // 最初のタブをアクティブに
