@@ -4,61 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BLS署名</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 </head>
 <body>
-<h1>BLS署名 (BLS12-381)</h1>
-<p><a href="./webauthn.html">WebAuthn (FIDO2) 署名 →</a></p>
-<p>公開鍵 G1 (48 byte) / 署名 G2 (96 byte) / DST: BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_</p>
-
-<h2>鍵生成</h2>
-<button id="keygen">鍵を生成する</button>
-<p>秘密鍵 (hex)<br><textarea id="keygen-sk" rows="2" cols="100" readonly></textarea></p>
-<p>公開鍵 (hex)<br><textarea id="keygen-pk" rows="2" cols="100" readonly></textarea></p>
-
-<h2>秘密鍵 → 公開鍵</h2>
-<p>秘密鍵 (hex)<br><textarea id="derive-sk" rows="2" cols="100"></textarea></p>
-<button id="derive">公開鍵を導出する</button>
-<p>公開鍵 (hex)<br><textarea id="derive-pk" rows="2" cols="100" readonly></textarea></p>
-
-<h2>署名</h2>
-<p>メッセージ<br><textarea id="sign-msg" rows="3" cols="100"></textarea></p>
-<p>秘密鍵 (hex)<br><textarea id="sign-sk" rows="2" cols="100"></textarea></p>
-<button id="sign">署名する</button>
-<p>署名 (hex)<br><textarea id="sign-sig" rows="3" cols="100" readonly></textarea></p>
-
-<h2>検証</h2>
-<p>メッセージ<br><textarea id="verify-msg" rows="3" cols="100"></textarea></p>
-<p>公開鍵 (hex)<br><textarea id="verify-pk" rows="2" cols="100"></textarea></p>
-<p>署名 (hex)<br><textarea id="verify-sig" rows="3" cols="100"></textarea></p>
-<button id="verify">検証する</button>
-<p>結果: <span id="verify-result">—</span></p>
-
-<h2>署名の集約</h2>
-<p>署名 (hex, 1行に1つ)<br><textarea id="agg-sigs" rows="5" cols="100"></textarea></p>
-<button id="agg">集約する</button>
-<p>集約署名 (hex)<br><textarea id="agg-sig" rows="3" cols="100" readonly></textarea></p>
-
-<h2>集約検証 (メッセージがそれぞれ違う)</h2>
-<p>メッセージ (1行に1つ)<br><textarea id="aggv-msgs" rows="5" cols="100"></textarea></p>
-<p>公開鍵 (hex, 1行に1つ。メッセージと同じ順番)<br><textarea id="aggv-pks" rows="5" cols="100"></textarea></p>
-<p>集約署名 (hex)<br><textarea id="aggv-sig" rows="3" cols="100"></textarea></p>
-<button id="aggv">検証する</button>
-<p>結果: <span id="aggv-result">—</span></p>
-
-<h2>集約検証 (全員が同じメッセージ)</h2>
-<p>メッセージ<br><textarea id="fagg-msg" rows="3" cols="100"></textarea></p>
-<p>公開鍵 (hex, 1行に1つ)<br><textarea id="fagg-pks" rows="5" cols="100"></textarea></p>
-<p>集約署名 (hex)<br><textarea id="fagg-sig" rows="3" cols="100"></textarea></p>
-<button id="fagg">検証する</button>
-<p>結果: <span id="fagg-result">—</span></p>
-
-<h2>まとめて検証 (速さ比べ)</h2>
-<p>件数 <input id="race-n" size="5" value="32"> <button id="race-gen">署名を作る</button> <span id="race-gen-status"></span></p>
-<p><button id="race-one">1件ずつ verify</button> <span id="race-one-out">—</span></p>
-<p><button id="race-batch">バッチ検証 (1スレッド)</button> <span id="race-batch-out">—</span></p>
-<p><button id="race-pool">バッチ検証 (Worker 並列)</button> <span id="race-pool-out">—</span></p>
-<p><button id="race-bad">1件だけ壊してバッチ検証 (Worker 並列)</button> <span id="race-bad-out">—</span></p>
-
 <script type="module" src="./dist/main.js"></script>
 </body>
 </html>

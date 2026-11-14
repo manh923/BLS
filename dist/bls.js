@@ -1392,7 +1392,50 @@ export class BLS {
             return false;
         }
     }
+    // ═══ ブラインド署名 ═══════════════════════════════════════════════
+    //   1. 利用者: ランダムな r で M' = r·H(m) を作って署名者に渡す (r は手元に残す)
+    //   2. 署名者: 中身を見ずに σ' = sk·M' を返す
+    //   3. 利用者: σ = r⁻¹·σ' = sk·H(m)  → 普通の BLS 署名 (verify でそのまま検証できる)
+    //   署名者には M' しか見えず、r がランダムなので H(m) とも σ とも結び付けられない
+    //   ※ 署名者は何にでも署名してしまうので、ブラインド署名専用の鍵を使うこと
+    // 1. 目隠し
+    blind(msg) {
+        this.prof = {};
+        const r = this.step("r の生成", () => bytesToBig(this.generatePrivateKey()));
+        const H = this.step("H(m) hash-to-G2", () => hashToG2(msg, this.dst));
+        const B = this.step("r·H(m)", () => g2MulGLS(H, r));
+        return { blinded: g2ToBytes(B), r: bigToBytes(r, 32) };
+    }
+    // 2. 署名者: 目隠しされた点に sk を掛けるだけ
+    blindSign(blinded, sk) {
+        this.prof = {};
+        const k = this.skToScalar(sk);
+        const B = this.step("目隠しされた点の復元+部分群チェック", () => g2FromBytes(bytes(blinded)));
+        if (E2.isInf(B))
+            throw new Error("無限遠点には署名しない");
+        return this.step("sk·M'", () => g2ToBytes(g2MulGLS(B, k)));
+    }
+    // 3. 目隠しを外す: r⁻¹ (mod r の位数) を掛ける
+    unblind(blindSig, r) {
+        this.prof = {};
+        const rr = bytesToBig(bytes(r));
+        if (rr === 0n || rr >= R)
+            throw new Error("r が範囲外");
+        const S = this.step("署名者の返事の復元+部分群チェック", () => g2FromBytes(bytes(blindSig)));
+        return this.step("r⁻¹·σ'", () => g2ToBytes(g2MulGLS(S, invModR(rr))));
+    }
 }
+// mod r (群の位数) の逆元
+const invModR = (a) => {
+    let r0 = R, r1 = a % R;
+    let x0 = 0n, x1 = 1n;
+    while (r1 !== 0n) {
+        const q = r0 / r1;
+        [r0, r1] = [r1, r0 - q * r1];
+        [x0, x1] = [x1, x0 - q * x1];
+    }
+    return x0 < 0n ? x0 + R : x0;
+};
 // テスト用に中身も出しておく
 export const _internal = {
     P,

@@ -136,6 +136,23 @@ ok("fastAggregateVerify 1人抜け NG", !bls.fastAggregateVerify(msg, keys.slice
 ok("aggPk = noble", toHex(bls.aggregatePublicKeys(keys.map((k) => k.publicKey))) ===
   toHex(nb.aggregatePublicKeys(keys.map((k) => fromHex(k.publicKey)))));
 
+// ブラインド署名
+{
+  const signer = bls.generateKeyPair();
+  const m = enc.encode("100円券 #0001");
+  const { blinded, r } = t("blind", () => bls.blind(m));
+  const blindSig = t("blindSign", () => bls.blindSign(blinded, signer.privateKey));
+  const s = t("unblind", () => bls.unblind(blindSig, r));
+  ok("目隠しを外した署名 = 普通の署名 (sk·H(m))", toHex(s) === toHex(bls.sign(m, signer.privateKey)));
+  ok("目隠しを外した署名を verify で検証できる", bls.verify(m, signer.publicKey, s));
+  ok("noble でも検証できる", nb.verify(s, m, fromHex(signer.publicKey)));
+  ok("署名者が見た値は H(m) とも最終の署名とも違う", toHex(blinded) !== toHex(bls.hashToPoint(m)) && toHex(blindSig) !== toHex(s));
+  const b2 = bls.blind(m);
+  ok("同じメッセージでも毎回違う目隠しになる", toHex(b2.blinded) !== toHex(blinded));
+  ok("別の r で外すと無効な署名になる", !bls.verify(m, signer.publicKey, bls.unblind(blindSig, b2.r)));
+  ok("別のメッセージとしては通らない", !bls.verify(enc.encode("1000円券 #0001"), signer.publicKey, s));
+}
+
 // バッチ検証
 {
   const ks = Array.from({ length: 5 }, () => bls.generateKeyPair());
