@@ -335,6 +335,39 @@ const unpackHint = (b: Uint8Array, k: number, omega: number): Vec | null => {
   return h;
 };
 
+// ヒントの圧縮版: 1 の個数 (7bit) と、1 の位置の差をゴロム符号 (下位 4bit + 上位を 1 の連続) で
+//   位置は k 本の多項式をつなげた 0〜k·256-1 で数える
+const packHintGolomb = (w: BitWriter, h: Vec) => {
+  const pos: number[] = [];
+  h.forEach((p, i) => p.forEach((x, j) => x && pos.push(i * N + j)));
+  w.write(pos.length, 7);
+  let prev = -1;
+  for (const q of pos) {
+    const g = q - prev - 1;
+    w.write(g & 15, 4);
+    for (let i = 0; i < g >> 4; i++) w.write(1, 1);
+    w.write(0, 1);
+    prev = q;
+  }
+};
+const unpackHintGolomb = (r: BitReader, k: number, omega: number): Vec | null => {
+  const cnt = r.read(7);
+  if (cnt > omega) return null;
+  const h = Array.from({ length: k }, zero);
+  let prev = -1;
+  for (let i = 0; i < cnt; i++) {
+    let g = r.read(4);
+    let hi = 0;
+    while (r.read(1)) if (++hi > k * 16) return null;
+    g += hi << 4;
+    const q = prev + 1 + g;
+    if (q >= k * N) return null;
+    h[Math.floor(q / N)][q % N] = 1;
+    prev = q;
+  }
+  return h;
+};
+
 // ═══ 署名の各版 ═══════════════════════════════════════════════════
 export interface Params {
   id: string;
@@ -352,6 +385,8 @@ export interface Params {
   mode: 0 | 1 | 2;
   // ガウス分布版: σ = α·T (T は ‖c·s1‖ の上限。超えたら作り直し)
   gauss?: { alpha: number; T: number };
+  // ヒントを位置の差のゴロム符号で送る (ω + k バイト固定の代わり)
+  hintGolomb?: boolean;
 }
 const base = { k: 4, l: 4, tau: 39, gamma1: 1 << 17, gamma2: (Q - 1) / 88, omega: 80, d: 13 };
 export const VARIANTS: Params[] = [
@@ -360,6 +395,9 @@ export const VARIANTS: Params[] = [
   { ...base, id: "V2", name: "V2 公開鍵の下位ビットを捨てる", desc: "t の下位 13bit を捨ててヒントで補う (= ML-DSA-44 の形)", eta: 2, mode: 2 },
   { ...base, id: "V3", name: "V3 山型の z + ライス符号", desc: "y をガウス分布にして z を圧縮 (前に話したハフマンの発想)", eta: 2, mode: 2, gauss: { alpha: 11, T: 420 } },
   { ...base, id: "V4", name: "V4 秘密を 0/±1 に", desc: "V3 の秘密を η = 1 にして ‖c·s1‖ を小さく", eta: 1, mode: 2, gauss: { alpha: 11, T: 260 } },
+  { ...base, id: "V5", name: "V5 T を詰めてヒントも圧縮", desc: "‖c·s1‖ の上限 T を実測の最大 (約178) まで詰めて、ヒントの位置をゴロム符号で", eta: 1, mode: 2, gauss: { alpha: 11, T: 180 }, hintGolomb: true },
+  { ...base, id: "V6", name: "V6 α を 4 に", desc: "V5 の σ = α·T をさらに小さく (やり直しが増える)", eta: 1, mode: 2, gauss: { alpha: 4, T: 180 }, hintGolomb: true },
+  { ...base, id: "V7", name: "V7 α を 3 に", desc: "V6 よりさらに小さく (やり直しがもっと増える)", eta: 1, mode: 2, gauss: { alpha: 3, T: 180 }, hintGolomb: true },
 ];
 
 export interface SecretKey {
@@ -476,6 +514,14 @@ export const sign = (sk: SecretKey, msg: Uint8Array): Uint8Array => {
     const weight = h.reduce((s, p) => s + p.reduce((a, x) => a + x, 0), 0);
     if (weight > P.omega) continue;
     lastAttempts = attempt;
+    if (P.hintGolomb) {
+      // ヒントと z を 1 本のビット列に (ヒントが先)
+      const w2 = new BitWriter();
+      packHintGolomb(w2, h);
+      if (P.gauss) packRice(w2, z, riceL(P));
+      else packUniform(w2, z, P.gamma1);
+      return concat(ch, w2.bytesOut());
+    }
     return concat(ch, packHint(h, P.omega), wr.bytesOut());
   }
   throw new Error("署名できなかった (やり直しすぎ)");
@@ -490,12 +536,16 @@ export const verify = (P: Params, pk: Uint8Array, msg: Uint8Array, sig: Uint8Arr
     const ch = sig.subarray(0, 32);
     let off = 32;
     let h: Vec | null = null;
-    if (P.mode === 2) {
+    if (P.mode === 2 && !P.hintGolomb) {
       h = unpackHint(sig.subarray(32, 32 + P.omega + P.k), P.k, P.omega);
       if (!h) return false;
       off += P.omega + P.k;
     }
     const r = new BitReader(sig.subarray(off));
+    if (P.mode === 2 && P.hintGolomb) {
+      h = unpackHintGolomb(r, P.k, P.omega);
+      if (!h) return false;
+    }
     const z = P.gauss ? unpackRice(r, P.l, riceL(P)) : unpackUniform(r, P.l, P.gamma1);
     if (P.gauss) {
       if (Math.sqrt(l2sq(z)) > l2Bound(P)) return false;
@@ -507,6 +557,7 @@ export const verify = (P: Params, pk: Uint8Array, msg: Uint8Array, sig: Uint8Arr
     }
     // 余分なバイトがないか (署名は一意に)
     if (Math.ceil(r.bitPos / 8) !== sig.length - off) return false;
+    if (r.bitPos & 7 && sig[sig.length - 1] >> (r.bitPos & 7)) return false; // 余りのビットは 0
     const chat = ntt(sampleInBall(ch, P.tau));
     const Az = matVec(Ahat, vntt(z));
     let wPrime: Vec;

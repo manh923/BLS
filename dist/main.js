@@ -412,6 +412,8 @@ import { Dilithium2Small } from "./dilithium/Dilithium2Small.js";
                 ["元の Dilithium2 (cryptos)", new Dilithium2()],
                 ["改造版 η=2 (ガウス + ライス符号)", new Dilithium2Small({ eta: 2 })],
                 ["改造版 η=1", new Dilithium2Small({ eta: 1 })],
+                ["改造版 η=1 T=180 + ヒント圧縮", new Dilithium2Small({ eta: 1, T: 180, hintGolomb: true })],
+                ["改造版 η=1 T=180 + ヒント圧縮 + α=3 (遅い)", new Dilithium2Small({ eta: 1, T: 180, alpha: 3, hintGolomb: true })],
             ];
             dOut.textContent = "計算中...";
             for (const [name, d] of list) {

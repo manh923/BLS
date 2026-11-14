@@ -12,6 +12,8 @@ for (const [name, d] of [
   ["元の Dilithium2 (cryptos)", new Dilithium2()],
   ["改造版 η=2 (ガウス + ライス符号)", new Dilithium2Small({ eta: 2 })],
   ["改造版 η=1", new Dilithium2Small({ eta: 1 })],
+  ["改造版 η=1 T=180 + ヒント圧縮", new Dilithium2Small({ eta: 1, T: 180, hintGolomb: true })],
+  ["改造版 η=1 T=180 + ヒント圧縮 + α=3", new Dilithium2Small({ eta: 1, T: 180, alpha: 3, hintGolomb: true })],
 ]) {
   const { pk, sk } = d.keyGen();
   let size = 0, min = Infinity, max = 0, att = 0, ts = 0, tv = 0, good = true;

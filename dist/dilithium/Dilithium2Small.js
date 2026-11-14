@@ -444,8 +444,11 @@ export class Dilithium2Small {
     //   T は ‖c·s1‖₂ の上限 (超えたら作り直し)。η は 1 か 2
     ALPHA;
     TBOUND;
+    HINT_GOLOMB;
     lastAttempts = 0;
+    // hintGolomb: ヒントを ω+k バイト固定ではなく、1 の位置の差のゴロム符号で送る
     constructor(opts = {}) {
+        this.HINT_GOLOMB = opts.hintGolomb ?? false;
         this.ETA = opts.eta ?? 2;
         this.BETA = BigInt(this.TAU * this.ETA);
         this.ALPHA = opts.alpha ?? 11;
@@ -1236,6 +1239,108 @@ export class Dilithium2Small {
             return null;
         }
     }
+    // ヒント (ゴロム符号) と z (ライス符号) を 1 本のビット列に
+    //   ヒント: 1 の個数 7bit + 位置の差 (下位 4bit + 上位を 1 の連続)。位置は K 本をつなげて数える
+    packHintAndZ(hints, z) {
+        const out = [];
+        let acc = 0, n = 0;
+        const put = (v, bits) => {
+            for (let i = 0; i < bits; i++) {
+                acc |= ((v >> i) & 1) << n;
+                if (++n === 8) {
+                    out.push(acc);
+                    acc = 0;
+                    n = 0;
+                }
+            }
+        };
+        const pos = [];
+        hints.forEach((h, i) => h.forEach((x, j) => x && pos.push(i * this.N + j)));
+        put(pos.length, 7);
+        let prev = -1;
+        for (const q of pos) {
+            const g = q - prev - 1;
+            put(g & 15, 4);
+            for (let i = 0; i < g >> 4; i++)
+                put(1, 1);
+            put(0, 1);
+            prev = q;
+        }
+        const L = this.RICE_L;
+        for (const p of z)
+            for (const x of p) {
+                const c = this.centeredNum(x);
+                const a = Math.abs(c);
+                put(c < 0 ? 1 : 0, 1);
+                put(a & ((1 << L) - 1), L);
+                for (let i = 0; i < a >> L; i++)
+                    put(1, 1);
+                put(0, 1);
+            }
+        if (n)
+            out.push(acc);
+        return Uint8Array.from(out);
+    }
+    unpackHintAndZ(buf) {
+        let pos = 0;
+        const get = (bits) => {
+            let v = 0;
+            for (let i = 0; i < bits; i++) {
+                const byte = buf[pos >> 3];
+                if (byte === undefined)
+                    throw new Error("短い");
+                v |= ((byte >> (pos & 7)) & 1) << i;
+                pos++;
+            }
+            return v;
+        };
+        try {
+            const hints = Array.from({ length: this.K }, () => new Array(this.N).fill(0));
+            const cnt = get(7);
+            if (cnt > this.OMEGA)
+                return null;
+            let prev = -1;
+            for (let i = 0; i < cnt; i++) {
+                let g = get(4);
+                let hi = 0;
+                while (get(1))
+                    if (++hi > this.K * 16)
+                        return null;
+                g += hi << 4;
+                const q = prev + 1 + g;
+                if (q >= this.K * this.N)
+                    return null;
+                hints[Math.floor(q / this.N)][q % this.N] = 1;
+                prev = q;
+            }
+            const L = this.RICE_L;
+            const z = [];
+            for (let i = 0; i < this.L; i++) {
+                const p = new Array(this.N);
+                for (let j = 0; j < this.N; j++) {
+                    const s = get(1);
+                    let a = get(L);
+                    let hi = 0;
+                    while (get(1))
+                        if (++hi > 64)
+                            return null;
+                    a += hi << L;
+                    if (s && a === 0)
+                        return null;
+                    p[j] = this.mod(BigInt(s ? -a : a), this.Q);
+                }
+                z.push(p);
+            }
+            if (Math.ceil(pos / 8) !== buf.length)
+                return null;
+            if (pos & 7 && buf[buf.length - 1] >> (pos & 7))
+                return null;
+            return { hints, z };
+        }
+        catch {
+            return null;
+        }
+    }
     // FIPS 204 どおりの厳しいヒントの読み出し (位置は昇順、使わない所は 0)
     unpackHintStrict(buf) {
         const hints = [];
@@ -1308,6 +1413,8 @@ export class Dilithium2Small {
             if (count > this.OMEGA)
                 continue;
             this.lastAttempts = attempt;
+            if (this.HINT_GOLOMB)
+                return this.concat(cTilde, this.packHintAndZ(hints, z));
             return this.concat(cTilde, this.packZRice(z), this.packHint(hints));
         }
         return null;
@@ -1316,16 +1423,23 @@ export class Dilithium2Small {
     verify(pkBytes, msg, sig) {
         try {
             const hintLen = this.OMEGA + this.K;
-            if (sig.length < 32 + hintLen)
+            if (sig.length < 32 + (this.HINT_GOLOMB ? 1 : hintLen))
                 return false;
             const pk = this.decodePk(pkBytes);
             const A = this.expandA(pk.rho);
             const cTilde = sig.slice(0, 32);
-            const z = this.unpackZRice(sig.slice(32, sig.length - hintLen));
-            if (!z)
-                return false;
-            const hints = this.unpackHintStrict(sig.slice(sig.length - hintLen));
-            if (!hints)
+            let z, hints;
+            if (this.HINT_GOLOMB) {
+                const r = this.unpackHintAndZ(sig.slice(32));
+                if (!r)
+                    return false;
+                ({ z, hints } = r);
+            }
+            else {
+                z = this.unpackZRice(sig.slice(32, sig.length - hintLen));
+                hints = this.unpackHintStrict(sig.slice(sig.length - hintLen));
+            }
+            if (!z || !hints)
                 return false;
             if (Math.sqrt(this.l2sq(z)) > this.L2_BOUND)
                 return false;
