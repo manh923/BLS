@@ -4,9 +4,8 @@
   "description": "BLS署名 (BLS12-381) を bigint だけで",
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node test/test.mjs && node test/webauthn.mjs && node test/pool.mjs 8 && node test/wasm.mjs",
-    "bench": "tsc && node test/bench.mjs && node test/pool.mjs 32 && node test/wasm.mjs",
-    "build:wasm": "cd rust && cargo build --release --target wasm32-unknown-unknown && cp target/wasm32-unknown-unknown/release/bls12381.wasm ../dist/"
+    "test": "tsc && node test/test.mjs && node test/webauthn.mjs && node test/pool.mjs 8",
+    "bench": "tsc && node test/bench.mjs && node test/pool.mjs 32"
   },
   "repository": {
     "type": "git",

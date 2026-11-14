@@ -1439,6 +1439,4 @@ export const _internal = {
     f2sqr,
     psi,
     HARD_EXP: (P ** 4n - P ** 2n + 1n) / R,
-    // Rust 版の定数を書き出す用
-    consts: { FROB, PSI_X, PSI_Y, BETA, SSWU_A, SSWU_B, SSWU_Z, SSWU_MB_A, SSWU_B_ZA, ISO, INV2, X_ABS },
 };
